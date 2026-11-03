@@ -2475,7 +2475,7 @@ jobs:
       - name: Upload AnyKernel3
         uses: actions/upload-artifact@v7
         with:
-          retention-days: 1
+          retention-days: 3
           name: AnyKernel3_SukiSUUltra_${{ env.KSUVER }}_${{ steps.extract_info.outputs.value }}(${{ env.CKERNEL_VERSION }})${{ steps.suffix.outputs.value }}
           path: ./AnyKernel3/*
 
@@ -2582,7 +2582,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          retention-days: 1
+          retention-days: 3
           name: sched-modules-${{ steps.extract_info.outputs.value }}
           path: |
             ./sched-modules/*
@@ -2614,7 +2614,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          retention-days: 1
+          retention-days: 3
           name: module-inventory-${{ steps.extract_info.outputs.value }}
           path: ./module-inventory.txt
 
@@ -2675,7 +2675,7 @@ jobs:
         if: startsWith(github.event.inputs.ZRAM, '1/') && steps.zram_find.outputs.upload != 'false'
         uses: actions/upload-artifact@v7
         with:
-          retention-days: 1
+          retention-days: 3
           name: ZRAM-Module_${{ env.KERNEL_VERSION }}_${{ steps.extract_info.outputs.value }}
           path: ZRAM-Module/*
 

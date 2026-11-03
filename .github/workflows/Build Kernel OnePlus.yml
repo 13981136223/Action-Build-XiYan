@@ -1701,6 +1701,24 @@ jobs:
           echo "⚠️ 仍未证的另一半：MODVERSIONS 的符号 CRC。串一致不代表 CRC 一致，"
           echo "   若原厂 .ko 报 'disagrees about version of symbol' 则必须改用与原厂同代源码。"
 
+      - name: Fingerprint sources right before build
+        run: |
+          # 6.12 线一直出现的怪事：第 29 步里 exec.c 只有 1 份、include 在第 31 行、核对全绿，
+          # 可编译仍报 fs/exec.c:1949 未声明 —— 而 1949 正好等于我们改后的 1952 减掉插入的 3 行，
+          # 也就是编译器读的是**改之前**的那份。这里在真正开编之前把现场钉死：
+          # 整个 kernel_workspace 里每份 fs/exec.c 的 md5/是否有 include，加 common 的 git 状态。
+          # 只要这里的 md5 跟第 29 步打印的不一样，就能坐实「有人在编译前把树换掉/还原了」。
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+          echo "--- kernel_workspace 内所有 fs/exec.c ---"
+          find . -type f -path '*/fs/exec.c' -not -path '*/susfs4ksu/*' -not -path '*/SukiSU*' 2>/dev/null | while read -r F; do
+            printf '%s md5=%s include=%s callline=%s\n' "$F" \
+              "$(md5sum "$F" | cut -c1-10)" \
+              "$(grep -c '#include <linux/susfs_def.h>' "$F")" \
+              "$(grep -n 'susfs_is_current_proc_no_su' "$F" | tail -1 | cut -d: -f1)"
+          done
+          echo "--- common 的 git 状态（被 checkout/stash 还原过就会在这里露出来）---"
+          cd kernel_platform/common 2>/dev/null && { git rev-parse --short HEAD; git status --porcelain | head -12; } || echo "没有 common/.git"
+
       - name: Build Kernel FAST
         if: ${{ github.event.inputs.FAST_BUILD == 'true' }}
         id: fast_build

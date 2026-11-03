@@ -1,0 +1,11 @@
+name: Verify 612 Adapter
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 用 OnePlusOSS sm8845 真源码复现 6.12 现场并验适配器
+        run: bash scripts/verify612.sh "$GITHUB_WORKSPACE"

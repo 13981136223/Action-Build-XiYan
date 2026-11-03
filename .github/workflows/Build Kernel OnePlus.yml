@@ -884,14 +884,27 @@ jobs:
           # SukiSU 的目录是 kernel/preinit/common/runner/runner.c，而 6.12 的 Kbuild 按
           # tiann/KernelSU 的老布局引用 preinit/runner/runner.c —— 路径差一层 common/。
           # 这里把缺的那层补出来（只在真缺时补，且补完必须能找到 runner.c，否则当场失败）。
+          # 上一版只在「preinit 目录内部引用 runner」时才补路径 —— 静默没触发：
+          # runner.elf 的规则其实在**父级** drivers/kernelsu/Makefile 里（run 41719782999 仍报同一个 No rule）。
+          # 改成无条件：只要 preinit/common/runner/runner.c 在而 preinit/runner/runner.c 不在，就补一份。
+          # 多出来的目录不参与链接就不产生副作用，漏补才是直接把 6.12 全线打死。
           for PRE in $(find -L "$LSMDIR" -type d -path '*/drivers/kernelsu/preinit' 2>/dev/null); do
-            REF=$(grep -rlE 'runner/runner\.c|runner\.elf' "$PRE" 2>/dev/null | head -1)
-            [ -n "$REF" ] || continue
-            if [ -e "$PRE/runner/runner.c" ]; then echo "preinit/runner 已就位：$PRE"; continue; fi
-            [ -d "$PRE/common/runner" ] || { echo "::error::$PRE 的 Kbuild 引用 runner 但两种布局都没有：$REF"; exit 1; }
-            cp -r "$PRE/common/runner" "$PRE/runner"
-            [ -f "$PRE/runner/runner.c" ] || { echo "::error::补完仍缺 $PRE/runner/runner.c"; exit 1; }
-            echo "preinit 布局已补：$PRE/common/runner → $PRE/runner（runner.c $(wc -c < "$PRE/runner/runner.c") B）"
+            if [ -f "$PRE/common/runner/runner.c" ] && [ ! -e "$PRE/runner/runner.c" ]; then
+              cp -r "$PRE/common/runner" "$PRE/runner"
+              [ -f "$PRE/runner/runner.c" ] || { echo "::error::补完仍缺 $PRE/runner/runner.c"; exit 1; }
+              echo "preinit 布局已补：$PRE/common/runner → $PRE/runner（runner.c $(wc -c < "$PRE/runner/runner.c") B）"
+            elif [ -e "$PRE/runner/runner.c" ]; then
+              echo "preinit/runner 已就位：$PRE"
+            else
+              echo "preinit 里没有 common/runner，也不需要 runner/：$PRE"
+            fi
+          done
+          # 硬断：只要父级 Makefile 引用了 runner/runner.c，补完后必须能对上
+          for K in $(find -L "$LSMDIR" -type f -path '*/drivers/kernelsu/Makefile' 2>/dev/null); do
+            grep -qE 'runner/runner\.c|runner\.elf' "$K" || continue
+            D=$(dirname "$K")/preinit
+            [ -f "$D/runner/runner.c" ] || { echo "::error::$K 引用 runner 但 $D/runner/runner.c 不在"; exit 1; }
+            echo "已核对 $K 的 runner 引用 → $D/runner/runner.c 存在"
           done
           echo "ksu_lsmid_fix完成"
 

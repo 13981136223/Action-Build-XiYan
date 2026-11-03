@@ -878,6 +878,21 @@ jobs:
           curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ksu_lsmid_fix.py" -o "$FIX" \
             || { echo "::error::取不到 ksu_lsmid_fix.py（本仓库 scripts/ 下）"; exit 1; }
           python3 "$FIX" "$LSMDIR" || exit 1
+          # 6.12 真正的死因（不是前面那些被我自己注释文本误导的"未声明"）：
+          #   make[5]: *** No rule to make target '../../drivers/kernelsu/preinit/runner/runner.c',
+          #                  needed by 'drivers/kernelsu/preinit/runner.elf'.  Stop.
+          # SukiSU 的目录是 kernel/preinit/common/runner/runner.c，而 6.12 的 Kbuild 按
+          # tiann/KernelSU 的老布局引用 preinit/runner/runner.c —— 路径差一层 common/。
+          # 这里把缺的那层补出来（只在真缺时补，且补完必须能找到 runner.c，否则当场失败）。
+          for PRE in $(find -L "$LSMDIR" -type d -path '*/drivers/kernelsu/preinit' 2>/dev/null); do
+            REF=$(grep -rlE 'runner/runner\.c|runner\.elf' "$PRE" 2>/dev/null | head -1)
+            [ -n "$REF" ] || continue
+            if [ -e "$PRE/runner/runner.c" ]; then echo "preinit/runner 已就位：$PRE"; continue; fi
+            [ -d "$PRE/common/runner" ] || { echo "::error::$PRE 的 Kbuild 引用 runner 但两种布局都没有：$REF"; exit 1; }
+            cp -r "$PRE/common/runner" "$PRE/runner"
+            [ -f "$PRE/runner/runner.c" ] || { echo "::error::补完仍缺 $PRE/runner/runner.c"; exit 1; }
+            echo "preinit 布局已补：$PRE/common/runner → $PRE/runner（runner.c $(wc -c < "$PRE/runner/runner.c") B）"
+          done
           echo "ksu_lsmid_fix完成"
 
       - name: Apply Patches SukiSU Ultra

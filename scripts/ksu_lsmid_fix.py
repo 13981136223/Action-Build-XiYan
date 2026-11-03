@@ -85,17 +85,18 @@ def main():
             done.append(p)
     print('KSU_LSMID_FIX: 扫到 %d 份、改动 %d 份，其余已是修后状态' % (len(hits), len(done)))
 
-    # 硬断：参与编译的那份必须在场且确实已修。只改了两份无关拷贝也算"通过"就是假绿灯。
-    compiled = [p for p in hits if ('/common/' in p or '/kernel-' in p)
-                and p.endswith('/drivers/kernelsu/hook/lsm_hook.c')]
-    if not compiled:
-        print('::error::没识别出参与编译的那份 lsm_hook.c（路径形状与预期不符），拒绝当成通过')
-        return 2
-    for p in compiled:
-        if 'ksu_lsm_id' not in open(p, encoding='utf-8', errors='surrogateescape').read():
-            print('::error::参与编译的 %s 仍然没有 ksu_lsm_id' % p)
+    # 硬断：改完再走一遍树，任何一份 drivers/kernelsu/hook/lsm_hook.c 都不许还留着裸 "ksu" 调用。
+    # 早先用「路径里必须有 /common/ 或 /kernel-」认参与编译的那份，实测 6.1 线上只扫到 1 份且两条都不匹配
+    # （run 41683212606 就是被自己的判定打死的）—— 逐份复查比猜哪份生效可靠。
+    again = find_files(sys.argv[1])
+    for (p2 in again) {
+        f = again[p2]
+        body = open(f, encoding='utf-8', errors='surrogateescape').read()
+        if 'ksu_lsm_id' not in body:
+            print('::error::%s 仍是裸 "ksu" 调用，没被修到' % f)
             return 2
-    print('KSU_LSMID_FIX: 参与编译的 lsm_hook.c 已确认带 &ksu_lsm_id 分支（%d 份）' % len(compiled))
+    }
+    print('KSU_LSMID_FIX: 复查 ' + str(len(again)) + ' 份，全部已带 &ksu_lsm_id 分支')
     return 0
 
 

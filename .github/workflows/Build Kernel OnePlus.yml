@@ -867,6 +867,19 @@ jobs:
           grep -nE '^(REPO_OWNER|REPO_NAME|REPO_BRANCH|KSU_VERSION_API|KSU_VERSION_FULL|VERSION_TAG|GIT_BIN|CURL_BIN)' kernel/Makefile
           echo "::endgroup::"
 
+      - name: Fix KernelSU LSM registration for 6.12
+        run: |
+          # 6.12 起 security_add_hooks() 第三参数从 const char* 变成 const struct lsm_id*，
+          # 上游 SukiSU 还传 "ksu"，编译直接 -Wincompatible-pointer-types（run 41663264213）。
+          # 修法只在 >=6.12 分支传 &ksu_lsm_id，旧行留在一棵 #else 里，所以对 6.1/6.6 是无害改动。
+          LSMDIR="$GITHUB_WORKSPACE/kernel_workspace/kernel_platform"
+          [ -d "$LSMDIR" ] || { echo "::error::找不到 kernel_platform，LSM 修复没法做"; exit 1; }
+          FIX="/tmp/ksu_lsmid_fix.py"
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ksu_lsmid_fix.py" -o "$FIX" \
+            || { echo "::error::取不到 ksu_lsmid_fix.py（本仓库 scripts/ 下）"; exit 1; }
+          python3 "$FIX" "$LSMDIR" || exit 1
+          echo "ksu_lsmid_fix完成"
+
       - name: Apply Patches SukiSU Ultra
         env:
           FILE: ${{ github.event.inputs.FILE }}
@@ -2070,7 +2083,10 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           IMG=$(find . kernel_workspace -maxdepth 4 -type f -name Image 2>/dev/null | head -n 1)
           [ -n "$IMG" ] || { echo "::error::找不到 Image 产物"; exit 1; }
-          SRC=$(find . kernel_workspace -maxdepth 5 -type f -path "*/common/fs/susfs.c" 2>/dev/null | head -n 1)
+          # -L 是必须的：MTK 单仓布局里 kernel_platform/common 是指向 ../kernel-<ver> 的符号链接，
+          # find 默认不跟随，就会报「找不到 fs/susfs.c」（run 41663650850/41663658822 挂在这，
+          # 而内核其实已经编出来了 —— 闸门自己的瞎，不是构建的瞎）。
+          SRC=$(find -L . kernel_workspace -maxdepth 6 -type f \( -path "*/common/fs/susfs.c" -o -path "*/kernel-*/fs/susfs.c" \) 2>/dev/null | head -n 1)
           [ -n "$SRC" ] || { echo "::error::找不到拷进树里的 fs/susfs.c，无法核对符号面"; exit 1; }
           KC="${{ env.KSU_KCONFIG }}"
           if [ -z "$KC" ] || [ ! -f "$KC" ]; then
@@ -2081,7 +2097,7 @@ jobs:
           grep -aoE '^config (KSU_SUSFS_[A-Z0-9_]+|KSU_SUSFS)' "$KC" | sed 's/^config //' | sort -u > decl.txt
           # 还要认"我们主动设为 n"的那些：声明过 ≠ 打开。守卫是声明的，但值是我们自己关的，
           # 这类函数不在产物里是**设计**，不该混进缺失告警里当噪音（现在只有 ENABLE_LOG）。
-          CONF=$(find . kernel_workspace -type f -path "*/arch/arm64/configs/gki_defconfig" 2>/dev/null | head -n 1)
+          CONF=$(find -L . kernel_workspace -type f -path "*/arch/arm64/configs/gki_defconfig" 2>/dev/null | head -n 1)
           : > off.txt
           if [ -n "$CONF" ]; then
             { grep -oE '^CONFIG_KSU_SUSFS[A-Z0-9_]*=n$' "$CONF" | sed 's/^CONFIG_//; s/=n$//';
@@ -2702,4 +2718,3 @@ jobs:
 
       - name: Post-build Disk Check
         run: df -h
-# 登记触发注释（不影响任何步骤）

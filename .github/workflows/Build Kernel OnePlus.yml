@@ -971,6 +971,10 @@ jobs:
               URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/susfs612_adapter.py"
               curl -fsSL "$URL" -o "$ADAPTER" || { echo "::error::取不到 susfs612_adapter.py（本仓库 scripts/ 下）"; exit 1; }
               python3 "$ADAPTER" .
+              # 打完立刻核落地位置（"补过了"不等于"补对位置"，run 41696139519 就是教训）
+              CHK="/tmp/check612_landed.sh"
+              curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/check612_landed.sh" -o "$CHK"                 || { echo "::error::取不到 check612_landed.sh（本仓库 scripts/ 下）"; exit 1; }
+              bash "$CHK" . || exit 1
               echo "6.12 钩子适配完成"
             fi
 

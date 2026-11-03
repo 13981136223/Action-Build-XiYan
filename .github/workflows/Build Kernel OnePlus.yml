@@ -2695,12 +2695,14 @@ jobs:
           zram_path=""
           for path in "${search_paths[@]}"; do
             if [ -d "$path" ]; then
-              zram_path=$(find "$path" -type f -name "zram.ko" | head -n 1)
+              # -L：MTK 单仓布局里 kernel_platform/common 是符号链接，out 也常落在链接后面，
+              # 不跟随就找不到 zram.ko（MTK 包的 ZRAM 一直缺席就是这个原因，同 susfs.c 那次同形）。
+              zram_path=$(find -L "$path" -type f -name "zram.ko" 2>/dev/null | head -n 1)
               [ -n "$zram_path" ] && break
             fi
           done
           if [ -z "$zram_path" ]; then
-            zram_path=$(find "./kernel_workspace" -type f -name "zram.ko" | head -n 1)
+            zram_path=$(find -L "./kernel_workspace" -type f -name "zram.ko" 2>/dev/null | head -n 1)
           fi
           if [ -n "$zram_path" ] && [ -f "$zram_path" ]; then
             echo "✅ zram.ko file finally located at: $zram_path"

@@ -36,3 +36,27 @@ print('task_mmu.c：钩子共 %d 处，都在能看到 vma 的作用域里'
 PYCHK
 
 echo "CHECK612_LANDED: include 顺序与钩子作用域都对"
+
+# 现场清单：树里到底有几份 exec.c / task_mmu.c，每份「有调用吗 / 有 include 吗 / md5」。
+# 上一轮第 29 步全绿但编译仍报未声明，说明改的那份和编译的那份可能不是同一份；
+# 把每份的状态打出来，一眼就能看出是不是有副本漏改。
+echo "--- 6.12 现场副本清单 ---"
+python3 - "$D" <<'PYLIST'
+import hashlib
+import os
+import sys
+root = sys.argv[1]
+for name in ('exec.c', 'task_mmu.c'):
+    for dirpath, dirs, files in os.walk(root, followlinks=True):
+        if name not in files:
+            continue
+        if not dirpath.replace(os.sep, '/').endswith('/fs'):
+            continue
+        p = os.path.join(dirpath, name)
+        b = open(p, 'rb').read()
+        h = hashlib.md5(b).hexdigest()[:10]
+        txt = b.decode('utf-8', 'replace')
+        inc = 'susfs_def.h' in txt
+        use = ('susfs_is_current_proc_no_su' in txt) if name == 'exec.c' else ('SUSFS_IS_INODE_SUS_MAP' in txt)
+        print('%-56s md5=%s include=%s 用susfs=%s' % (p.replace(os.sep, '/'), h, inc, use))
+PYLIST

@@ -2159,6 +2159,24 @@ jobs:
           if [ -z "$MISS" ]; then echo "✅ 上游声明的全部 SUSFS 函数都编进了产物"; fi
           rm -f decl.txt sym_guards.txt want.txt skip.txt have_syms.txt
 
+      - name: Rebrand installer text
+        run: |
+          # 宣传/署名清理：删掉上游流水线在 anykernel.sh 里的 "Powered by GitHub@…" 横幅和
+          # 头部 "By Numbersf" 署名行，kernel.string 换成本包维护者。
+          # 有意保留：`## osm0sis @ xda-developers` 与包内 LICENSE —— AK3 是 BSD 风格授权，
+          # 「再分发必须保留版权声明」是许可条件，删掉它反而构成不合规分发。
+          set -e
+          cd "$GITHUB_WORKSPACE/AnyKernel3"
+          [ -f anykernel.sh ] || { echo "::error::没有 anykernel.sh"; exit 1; }
+          sed -i '/Powered by GitHub/Id' anykernel.sh
+          sed -i '/^## KernelSU with SUSFS By Numbersf/d' anykernel.sh
+          sed -i 's#^kernel\.string=.*#kernel.string=OnePlus Kernel by 汐颜#' anykernel.sh
+          grep -qi 'powered by github' anykernel.sh && { echo "::error::宣传行没删干净"; exit 1; }
+          grep -q 'osm0sis' anykernel.sh || { echo "::error::BSD 要求保留的版权行被误删"; exit 1; }
+          grep -q '^kernel.string=OnePlus Kernel by 汐颜' anykernel.sh || { echo "::error::kernel.string 没换成汐颜"; exit 1; }
+          sh -n anykernel.sh || { echo "::error::改完语法不过"; exit 1; }
+          echo "署名清理完成：宣传行已删、kernel.string 已换、版权行保留"
+
       - name: Add flash-time guards to AnyKernel3
         run: |
           # 这个 fork 的 tools/ak3-core.sh 已经把 do.devicecheck / supported.versions

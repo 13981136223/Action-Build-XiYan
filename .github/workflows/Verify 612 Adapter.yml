@@ -9,5 +9,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: 用 OnePlusOSS sm8845 真源码复现 6.12 现场并验适配器
         run: bash scripts/verify612.sh "$GITHUB_WORKSPACE"
-
-# 索引触发注释
+      - name: 验 KernelSU LSM 修复（三副本/正组/反向/幂等）
+        run: bash scripts/verify_lsmid.sh "$GITHUB_WORKSPACE"

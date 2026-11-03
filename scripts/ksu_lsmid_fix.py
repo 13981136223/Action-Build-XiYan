@@ -19,57 +19,83 @@ CALL_NEW = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)\n'
             '    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), &ksu_lsm_id);\n'
             '#else\n'
             '    security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), "ksu");\n'
-            '#endif // #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)\n')
+            '#endif // #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)')
 FUNC_ANCHOR = 'void __init ksu_lsm_hook_init(void)\n{\n'
 
 
-def find_file(root):
-    hits = []
-    # followlinks=True：MTK 是单仓布局，kernel_platform/common 是指向 ../kernel-<ver> 的符号链接，
-    # 不跟随就永远找不到文件（同一形状的坑已经在 susfs.c 那次踩过）。
+def find_files(root):
+    """树里 lsm_hook.c 可能有多份副本，实测 run 41670147343 命中 3 份：
+       common/drivers/kernelsu/hook/（参与编译的那份）、
+       kernel_platform/KernelSU/kernel/hook/（setup.sh 用的克隆）、
+       .source_date_epoch_dir/drivers/kernelsu/hook/（构建期另一份树拷贝）。
+       只挑 drivers/kernelsu/hook 这条路径（不挑克隆），按 realpath 去重后逐个改 ——
+       猜「哪份才生效」不如都改：动作幂等，漏一份才是真炸。
+       MTK 单仓布局里 common 是指向 ../kernel-<ver> 的符号链接，os.walk 要 followlinks=True。
+    """
+    hits, seen = [], set()
     for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
-        if 'lsm_hook.c' in filenames:
-            p = os.path.join(dirpath, 'lsm_hook.c')
-            if os.path.basename(dirpath) == 'hook' and 'kernelsu' in dirpath.lower():
-                hits.append(p)
+        if 'lsm_hook.c' not in filenames:
+            continue
+        if '/drivers/kernelsu/hook' not in dirpath.replace(os.sep, '/'):
+            continue
+        p = os.path.realpath(os.path.join(dirpath, 'lsm_hook.c'))
+        if p not in seen:
+            seen.add(p)
+            hits.append(p)
     return hits
+
+
+def patch_one(p):
+    with open(p, encoding='utf-8', errors='surrogateescape') as f:
+        s = f.read()
+    if 'ksu_lsm_id' in s:
+        return 'skip'
+    for a, why in ((CALL_OLD, '裸字符串调用行'), (FUNC_ANCHOR, 'ksu_lsm_hook_init 函数头')):
+        n = s.count(a)
+        if n != 1:
+            print('::error::%s 锚点命中 %d 次（应 1）：%s' % (p, n, why))
+            return 'fail'
+    s = s.replace(FUNC_ANCHOR, DEF_NEW + FUNC_ANCHOR, 1)
+    s = s.replace(CALL_OLD, CALL_NEW + '\n', 1)
+    # 自检：声明在场、6.12 分支传的是指针且只传一次。#else 里保留原写法是预期的，
+    # 所以不能用「"ksu"); 只出现一次」这种脆判据（它在 #else 里还在）。
+    if ('static struct lsm_id ksu_lsm_id' not in s
+            or s.count('ARRAY_SIZE(ksu_hooks), &ksu_lsm_id);') != 1):
+        print('::error::%s 改完自检没过（声明缺失或 &ksu_lsm_id 传参次数不对）' % p)
+        return 'fail'
+    with open(p, 'w', encoding='utf-8', errors='surrogateescape') as f:
+        f.write(s)
+    return 'ok'
 
 
 def main():
     if len(sys.argv) != 2:
         print('用法: ksu_lsmid_fix.py <kernel_platform 目录>')
         return 2
-    hits = find_file(sys.argv[1])
-    if len(hits) != 1:
-        print('::error::lsm_hook.c 命中 %d 个（应 1）：%s' % (len(hits), ' '.join(hits)))
+    hits = find_files(sys.argv[1])
+    if not hits:
+        print('::error::树里找不到任何 drivers/kernelsu/hook/lsm_hook.c —— SukiSU 没进树？')
         return 2
-    p = hits[0]
-    with open(p, encoding='utf-8', errors='surrogateescape') as f:
-        s = f.read()
-
-    if 'ksu_lsm_id' in s:
-        print('KSU_LSMID_FIX: 已修过，跳过 ' + p)
-        return 0
-
-    for a, why in ((CALL_OLD, '裸字符串调用行'), (FUNC_ANCHOR, 'ksu_lsm_hook_init 函数头')):
-        n = s.count(a)
-        if n != 1:
-            print('::error::%s 锚点命中 %d 次（应 1）：%s' % (p, n, why))
+    done = []
+    for p in hits:
+        r = patch_one(p)
+        if r == 'fail':
             return 2
+        if r == 'ok':
+            done.append(p)
+    print('KSU_LSMID_FIX: 扫到 %d 份、改动 %d 份，其余已是修后状态' % (len(hits), len(done)))
 
-    s = s.replace(FUNC_ANCHOR, DEF_NEW + FUNC_ANCHOR, 1)
-    s = s.replace(CALL_OLD, CALL_NEW.rstrip('\n') + '\n', 1)
-    with open(p, 'w', encoding='utf-8', errors='surrogateescape') as f:
-        f.write(s)
-
-    # 自检：声明/传参/旧写法三者都要对得上，且不能出现「声明没了但还在传 &ksu_lsm_id」
-    # 自检：声明在场、6.12 分支传的是指针、且只传一次；#else 里保留原写法是预期的，
-    # 所以不能用「"ksu"); 只出现一次」这种脆判据（它在 #else 里还在）。
-    if ('static struct lsm_id ksu_lsm_id' not in s
-            or s.count('ARRAY_SIZE(ksu_hooks), &ksu_lsm_id);') != 1):
-        print('::error::改完自检没过（声明缺失或 &ksu_lsm_id 传参次数不对）')
+    # 硬断：参与编译的那份必须在场且确实已修。只改了两份无关拷贝也算"通过"就是假绿灯。
+    compiled = [p for p in hits if ('/common/' in p or '/kernel-' in p)
+                and p.endswith('/drivers/kernelsu/hook/lsm_hook.c')]
+    if not compiled:
+        print('::error::没识别出参与编译的那份 lsm_hook.c（路径形状与预期不符），拒绝当成通过')
         return 2
-    print('KSU_LSMID_FIX: 已改 ' + p + '（6.12 传 &ksu_lsm_id，<6.12 保持原样）')
+    for p in compiled:
+        if 'ksu_lsm_id' not in open(p, encoding='utf-8', errors='surrogateescape').read():
+            print('::error::参与编译的 %s 仍然没有 ksu_lsm_id' % p)
+            return 2
+    print('KSU_LSMID_FIX: 参与编译的 lsm_hook.c 已确认带 &ksu_lsm_id 分支（%d 份）' % len(compiled))
     return 0
 
 

@@ -17,7 +17,7 @@ done
 echo "[源] KernelSU 克隆的 preinit = ${KSU:-没找到}"
 
 fixed=0
-for PRE in $(find -L "$KP" -type d -path '*/drivers/kernelsu/preinit' 2>/dev/null); do
+for PRE in $(find -L "$KP" -type d -name preinit 2>/dev/null); do
   if [ -f "$PRE/runner/runner.c" ]; then
     echo "[在场] $PRE/runner/runner.c"
     continue
@@ -50,7 +50,7 @@ done
 # 输出树 $O/drivers/kernelsu/preinit —— 从那儿数 ../../ 落回 $O/drivers/...，也就是它要的是
 # **out 树里**的 runner.c（run 41738160219：源树里已备好、保障步的硬断也过了，make 仍说 No rule）。
 # 所以同一份 runner.c 也要铺到对应的 out 路径（out 目录此刻可以不存在，mkdir -p 建出来即可）。
-for PRE in $(find -L "$KP" -type d -path '*/drivers/kernelsu/preinit' 2>/dev/null); do
+for PRE in $(find -L "$KP" -type d -name preinit 2>/dev/null); do
   [ -f "$PRE/runner/runner.c" ] || continue
   TOP=${PRE%/drivers/kernelsu/preinit}          # 该树的根（common/ 或 kernel-6.12/）
   OUT="$TOP/out/drivers/kernelsu/preinit/runner"
@@ -86,4 +86,20 @@ if grep -rlF -- '../../drivers/kernelsu/preinit/' "$KP" 2>/dev/null | grep -q .;
   echo "::error::仍有残留的相对依赖：$(grep -rlF -- '../../drivers/kernelsu/preinit/' "$KP" 2>/dev/null | tr '\n' ' ')"
   exit 1
 fi
+# 决定性一步：上游 kernel/Makefile 里有两行
+#   KSU_KERNEL_DIR := $(srctree)/$(src)    （绝对，能用）
+#   KSU_KERNEL_DIR := $(src)                 （相对，6.12 走的就是这条）
+# 规则 $(obj)/preinit/runner.elf: $(KSU_KERNEL_DIR)/preinit/runner/runner.c 在**输出树**里求值，
+# 相对形式会展开成 $O/drivers/kernelsu/preinit/runner/runner.c —— make 打印的
+# "../../drivers/kernelsu/preinit/runner/runner.c" 正是它（run 41757643172 现场）。
+# 这也解释了为什么往前置源树或 out 树铺 runner.c 都没用：要的那个路径在 bazel/Kleaf 的输出树里。
+# 把相对那条改成绝对形式即可，且改完必须零残留。
+for M in $(find -L "$KP" -type f -path '*/drivers/kernelsu/Makefile' 2>/dev/null); do
+  grep -qxF 'KSU_KERNEL_DIR := $(src)' "$M" || continue
+  awk '{ if ($0 == "KSU_KERNEL_DIR := $(src)") print "KSU_KERNEL_DIR := $(srctree)/$(src)"; else print }' "$M" > "$M.tmp" && mv "$M.tmp" "$M"
+  grep -qxF 'KSU_KERNEL_DIR := $(src)' "$M" && { echo "::error::$M 相对定义仍在（改写没生效）"; exit 1; }
+  grep -qxF 'KSU_KERNEL_DIR := $(srctree)/$(src)' "$M" || { echo "::error::$M 改完找不到绝对定义"; exit 1; }
+  echo "[定义改绝对] $M"
+done
+
 echo "ENSURE_PREINIT: 补齐 $fixed 处，引用与文件全部对得上"

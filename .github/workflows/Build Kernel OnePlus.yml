@@ -1255,6 +1255,15 @@ jobs:
           # 而下一行的 -f 判断本来就是为"没补丁"准备的。改成 || true 让它走到 FENGCHI_SKIP。
           cp ./SCHED_PATCH/fengchi_${CLEAN_FILE}.patch ./ || true
           if [[ -f "fengchi_${CLEAN_FILE}.patch" ]]; then
+            # 先 dry-run：这台机型的树与补丁对不上时（实测 oneplus_13s_b 在
+            # include/linux/sched.h 有 1 个 hunk FAILED），原来是直接打死整条构建 ——
+            # 结果是这台机型连"不带风驰的内核"都拿不到。现在改成明确跳过并告警，
+            # 让包照样出来；风驰有没有真生效改由产物 Image 里的 hmbird 符号判定（交付侧已改成实测）。
+            if ! patch -p1 --dry-run -F 3 < "fengchi_${CLEAN_FILE}.patch" >/dev/null 2>&1; then
+              echo "::warning::FENGCHI_SKIP: fengchi_${CLEAN_FILE}.patch 与该机型树不匹配（dry-run 有 hunk 失败），本轮不带风驰继续构建"
+              echo "FENGCHI_VERDICT: 未生效（补丁不适配，已降级）"
+              exit 0
+            fi
             echo "正在打风驰补丁"
             dos2unix "fengchi_${CLEAN_FILE}.patch"
             patch -p1 -F 3 < "fengchi_${CLEAN_FILE}.patch"
@@ -1747,16 +1756,27 @@ jobs:
           echo "--- common 的 git 状态（被 checkout/stash 还原过就会在这里露出来）---"
           cd kernel_platform/common 2>/dev/null && { git rev-parse --short HEAD; git status --porcelain | head -12; } || echo "没有 common/.git"
 
-          echo "--- runner 依赖到底想落在哪（make 说 No rule，但修复步两处都报「已就位」）---"
-          for K in $(find -L kernel_platform -type f -path '*/drivers/kernelsu/Makefile' 2>/dev/null); do
-            echo "[$K]"; grep -nE 'runner|preinit' "$K" | head -6
+          # runner 依赖现场（全部 || true：这一步只许观察，不许因为自己查不到而把构建打死，
+          # 上一版就是这么在编译之前先失败了一次 run 41731790551）
+          for K in $(find -L kernel_platform -type f -path '*/drivers/kernelsu/Makefile' 2>/dev/null || true); do
+            echo "[Makefile] $K"; grep -nE 'runner|preinit' "$K" 2>/dev/null | head -6 || true
           done
-          for D in $(find -L kernel_platform -type d -name preinit -path '*/drivers/kernelsu/*' 2>/dev/null); do
-            echo "[dir] $D"; ls -l "$D" | head -8; ls -l "$D/runner" 2>/dev/null | head -6
+          for D in $(find -L kernel_platform -type d -name preinit -path '*/drivers/kernelsu/*' 2>/dev/null || true); do
+            echo "[dir] $D"; ls -l "$D" 2>/dev/null | head -8 || true; ls -l "$D/runner" 2>/dev/null | head -6 || true
           done
-          echo "[mtime] 快照目录 vs 修复时间"
-          find kernel_platform -maxdepth 1 -name '.source_date_epoch_dir' -printf '%T@ %p\n' 2>/dev/null | head -2
-          stat -c '%Y %n' kernel_platform/common/drivers/kernelsu/preinit 2>/dev/null
+          ls -l kernel_platform/common/drivers/kernelsu/preinit 2>/dev/null | head -10 || true
+          echo "[快照目录]"
+          ls -ld kernel_platform/.source_date_epoch_dir 2>/dev/null || echo "  没有 .source_date_epoch_dir"
+          echo "[runner.c 落在哪]"
+          find -L kernel_platform -type f -name runner.c -path '*kernelsu*preinit*' 2>/dev/null || true
+
+      - name: Ensure KernelSU preinit runner
+        run: |
+          # 上一轮现场打印证明：修复步跑完时 runner 在，开编前整个 preinit 里一个 runner.c 都没有
+          # （setup.sh 之后还有步骤在动 drivers/kernelsu）。所以这道补必须在**紧贴开编**的位置。
+          ENS="/tmp/ensure_preinit_runner.sh"
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/scripts/ensure_preinit_runner.sh" -o "$ENS"             || { echo "::error::取不到 ensure_preinit_runner.sh"; exit 1; }
+          bash "$ENS" "$GITHUB_WORKSPACE/kernel_workspace" || exit 1
 
       - name: Build Kernel FAST
         if: ${{ github.event.inputs.FAST_BUILD == 'true' }}

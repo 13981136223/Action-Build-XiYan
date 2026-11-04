@@ -64,4 +64,15 @@ for PRE in $(find -L "$KP" -type d -path '*/drivers/kernelsu/preinit' 2>/dev/nul
   fi
 done
 
+# 最后一条兜底，且不依赖我猜 O= 是哪个目录：把那条规则里的相对依赖改写成绝对形式。
+# make 报 `No rule to make target '../../drivers/kernelsu/preinit/runner/runner.c'`，
+# 而源树、out 树两处我都铺了文件、硬断也过了它照样报 —— 说明 `../../` 是从某个我猜不到的
+# 输出目录（Kleaf/bazel 的 execroot）数上去的。改成 `$(srctree)/drivers/...` 就跟 O= 无关了。
+for K in $(find -L "$KP" -type f \( -name Makefile -o -name Kbuild \) -path '*/drivers/kernelsu/*' 2>/dev/null); do
+  grep -q '\.\./\.\./drivers/kernelsu/preinit/' "$K" || continue
+  sed -i 's#\.\./\.\./drivers/kernelsu/preinit/#$(srctree)/drivers/kernelsu/preinit/#g' "$K"
+  grep -q 'srctree)/drivers/kernelsu/preinit/' "$K" || { echo "::error::$K 改写失败"; exit 1; }
+  echo "[依赖改绝对] $K → \$(srctree)/drivers/kernelsu/preinit/…（$(grep -c 'srctree)/drivers/kernelsu/preinit/' "$K") 处）"
+done
+
 echo "ENSURE_PREINIT: 补齐 $fixed 处，引用与文件全部对得上"

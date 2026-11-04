@@ -7,7 +7,7 @@
 #   - 表里没有这行 = 两列都空，等同于最保守的"SoC + 安卓 + KMI 前缀"三重检查。
 #   - 原厂构建时间串（uname -v 里那段）由 BUILD_TIME 输入控制，不在这张表里。
 oneplus_ace5|6.1.118-android14-11-o-g778e4490e346|OP5D2BL1 PKG110
-oneplus_ace5_b|6.1.118-android14-11-o-g778e4490e346|OP5D2BL1 PKG110
+oneplus_ace5_b||
 oneplus_ace5_pro||
 oneplus_ace3_pro||
 oneplus_pad_pro||

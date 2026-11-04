@@ -68,11 +68,22 @@ done
 # make 报 `No rule to make target '../../drivers/kernelsu/preinit/runner/runner.c'`，
 # 而源树、out 树两处我都铺了文件、硬断也过了它照样报 —— 说明 `../../` 是从某个我猜不到的
 # 输出目录（Kleaf/bazel 的 execroot）数上去的。改成 `$(srctree)/drivers/...` 就跟 O= 无关了。
-for K in $(find -L "$KP" -type f \( -name Makefile -o -name Kbuild \) -path '*/drivers/kernelsu/*' 2>/dev/null); do
-  grep -q '\.\./\.\./drivers/kernelsu/preinit/' "$K" || continue
+# 上一版只在 */drivers/kernelsu/* 里的 Makefile/Kbuild 找那句相对依赖 —— 保障步没打印
+# [依赖改绝对]，说明声明 `../../drivers/kernelsu/preinit/runner/runner.c` 的文件根本不在那个范围里
+# （run 41748265605 仍报同一句 No rule）。改成在全树找这个字面量，找到就改，找不到就点名，
+# 不再靠我猜它写在哪个文件。
+HITS=$(grep -rlF -- '../../drivers/kernelsu/preinit/' "$KP" 2>/dev/null || true)
+if [ -z "$HITS" ]; then
+  echo "[无相对依赖] 全树没有 ../../drivers/kernelsu/preinit/ 字面量（6.1/6.6 就这样，正常：没有这条规则就不用改，不能当成错误）"
+fi
+for K in $HITS; do
   sed -i 's#\.\./\.\./drivers/kernelsu/preinit/#$(srctree)/drivers/kernelsu/preinit/#g' "$K"
-  grep -q 'srctree)/drivers/kernelsu/preinit/' "$K" || { echo "::error::$K 改写失败"; exit 1; }
-  echo "[依赖改绝对] $K → \$(srctree)/drivers/kernelsu/preinit/…（$(grep -c 'srctree)/drivers/kernelsu/preinit/' "$K") 处）"
+  grep -qF 'srctree)/drivers/kernelsu/preinit/' "$K" || { echo "::error::$K 改写失败"; exit 1; }
+  echo "[依赖改绝对] $K（$(grep -cF 'srctree)/drivers/kernelsu/preinit/' "$K") 处）"
 done
-
+# 改完必须一个残留都不留，否则 make 还会从相对路径去找
+if grep -rlF -- '../../drivers/kernelsu/preinit/' "$KP" 2>/dev/null | grep -q .; then
+  echo "::error::仍有残留的相对依赖：$(grep -rlF -- '../../drivers/kernelsu/preinit/' "$KP" 2>/dev/null | tr '\n' ' ')"
+  exit 1
+fi
 echo "ENSURE_PREINIT: 补齐 $fixed 处，引用与文件全部对得上"

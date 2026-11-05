@@ -210,9 +210,9 @@ static u32 find_khz(unsigned long base)
 }
 
 /* 读某条 mode 的帧率字段 */
-static u32 mode_fps(unsigned long m, u32 off, u32 u16, bool *ok)
+static u32 mode_fps(unsigned long m, u32 off, u32 is_u16, bool *ok)
 {
-	if (u16) {
+	if (is_u16) {
 		u16 v = 0;
 
 		*ok = !rd(m + off, &v, sizeof(v));
@@ -283,7 +283,7 @@ static bool try_modes_at(unsigned long d, u32 slot, u32 count)
 	bool ok;
 	unsigned long arr = rptr(d + slot, &ok);
 	unsigned long m0;
-	u32 i, clk_off, fps_off, u16 = 0;
+	u32 i, clk_off, fps_off, fps16 = 0;
 	int last120 = -1, n120 = 0;
 
 	if (!ok || !kern(arr))
@@ -309,12 +309,12 @@ static bool try_modes_at(unsigned long d, u32 slot, u32 count)
 	/* 帧率先在 0 号上定位（u32 优先，其次 u16） */
 	fps_off = find_u32(m0, 120, FIELD_WIN);
 	if (fps_off != U32_MAX) {
-		u16 = 0;
+		fps16 = 0;
 	} else {
 		fps_off = find_u16(m0, 120, FIELD_WIN);
 		if (fps_off == U32_MAX)
 			return false;
-		u16 = 1;
+		fps16 = 1;
 	}
 
 	for (i = 0; i < count; i++) {
@@ -326,7 +326,7 @@ static bool try_modes_at(unsigned long d, u32 slot, u32 count)
 			return false;
 		if (!is32(m + clk_off, src_clk))
 			return false;
-		f = mode_fps(m, fps_off, u16, &fok);
+		f = mode_fps(m, fps_off, fps16, &fok);
 		if (!fok)
 			return false;
 		if (f == 120) {
@@ -339,7 +339,7 @@ static bool try_modes_at(unsigned long d, u32 slot, u32 count)
 	L.modes_arr = arr;
 	L.clk_off = clk_off;
 	L.fps_off = fps_off;
-	L.fps_u16 = u16;
+	L.fps_u16 = fps16;
 	L.count = count;
 	L.slot = want_slot >= 0 && want_slot < (int)count ? want_slot : last120;
 
@@ -675,7 +675,7 @@ static int do_apply(void)
 	if (ret)
 		return ret;
 
-	say("写入 mode=%px：clk %u->%u，fps->%u", m, SAVE.clk, want_clk, want_fps);
+	say("写入 mode=0x%lx：clk %u->%u，fps->%u", m, SAVE.clk, want_clk, want_fps);
 	w32(m + L.clk_off, want_clk);
 	for (i = 0; i < (int)L.clk_n && i < 4; i++)
 		w32(m + L.clk_offs[i], want_clk);

@@ -681,6 +681,42 @@ static int do_restore(void)
 	return 0;
 }
 
+/* 把目标 mode 结构体的前 384 字节按 u32 打出来：参考样本还会改
+ * mode_index / width / height 等字段，本机无法靠指纹确认，就一次打全，
+ * 上机后据此判定。写 parameters/dump 触发，结果进 report。 */
+static void dump_mode(void)
+{
+	unsigned long m = target_mode();
+	u32 off;
+
+	if (!m) {
+		say("dump: 还没有目标 mode");
+		return;
+	}
+	say("dump mode=0x%lx（每行 4 组 偏移=值）", m);
+	for (off = 0; off + 4 <= 384; off += 4) {
+		bool ok;
+		u32 v = r32(m + off, &ok);
+
+		if (!ok)
+			break;
+		if (off % 16 == 0)
+			say("  +0x%03x: 0x%x", off, v);
+		else
+			say("          +0x%03x: 0x%x", off, v);
+	}
+}
+
+static int dump_set(const char *val, const struct kernel_param *kp)
+{
+	dump_mode();
+	return 0;
+}
+
+static const struct kernel_param_ops dump_ops = { .set = dump_set };
+module_param_cb(dump, &dump_ops, NULL, 0200);
+MODULE_PARM_DESC(dump, "写任意值把目标 mode 结构体前 384 字节打进 report");
+
 static ssize_t report_get(char *buf, const struct kernel_param *kp)
 {
 	size_t n = READ_ONCE(report_len);

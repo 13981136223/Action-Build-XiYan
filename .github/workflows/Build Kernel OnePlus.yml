@@ -2600,17 +2600,26 @@ jobs:
           [ -n "$PB" ] && CLANG=$(find "$PB/clang/host/linux-x86" -maxdepth 2 -type f -name clang -path '*/bin/clang' 2>/dev/null | head -1)
           [ -n "$CLANG" ] || CLANG=$(find kernel_workspace/kernel_platform -maxdepth 8 -type f -name clang -path '*/clang-r*/bin/clang' 2>/dev/null | head -1)
           [ -n "$CLANG" ] || { echo "::error::没找到 prebuilts clang（prebuilts 目录=$PB）"; exit 1; }
+          # 必须转成绝对路径：find 给出的是相对路径，kbuild 的子 make 换目录后
+          # PATH 里的相对条目会失效，于是悄悄改用 runner 自带的 Ubuntu clang，
+          # 接着 llvm-nm 对不上就 Terminated。上一轮就是这么死的。
+          CLANG=$(cd "$(dirname "$CLANG")" && pwd)/$(basename "$CLANG")
           BIN=$(dirname "$CLANG")
           export PATH="$BIN:$PATH"
           V="$("$CLANG" --version | head -1)"
-          echo "clang=$V"
+          echo "clang=$CLANG"
+          echo "clang 版本=$V"
           case "$V" in
             *"clang version 17.0.2"*) ;;
             *) echo "::error::clang 不是 17.0.2（目标内核由 r487747c/17.0.2 编），KCFI 类型哈希对不上，不发产物"; exit 1 ;;
           esac
-          for t in ld.lld llvm-nm llvm-objcopy llvm-strip; do
+          TOOLS=""
+          for t in ld.lld llvm-nm llvm-objcopy llvm-strip llvm-ar llvm-ranlib llvm-objdump llvm-readelf; do
             [ -x "$BIN/$t" ] || { echo "::error::工具链缺 $t"; exit 1; }
+            TOOLS="$TOOLS $t"
           done
+          echo "工具齐备:$TOOLS"
+          COMMONABS=$(cd "$COMMON" && pwd)
 
           # 仓库根在构建机上会被挂载盖掉，按本次 commit 从 raw 取源码（与 CRC 那一步同一个坑）
           SRC=$(mktemp -d)
@@ -2628,17 +2637,19 @@ jobs:
           if [ ! -f "$OUTABS/include/config/auto.conf" ]; then
             echo "auto.conf 缺失 → 补 modules_prepare"
             [ -f "$OUTABS/.config" ] || { echo "::error::连 .config 都没有，无法 prepare"; exit 1; }
-            make -C "$COMMON" O="$OUTABS" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-                 CROSS_COMPILE=aarch64-linux-gnu- CC=clang LD=ld.lld NM=llvm-nm \
-                 OBJCOPY=llvm-objcopy STRIP=llvm-strip HOSTCC=gcc \
+            make -C "$COMMONABS" O="$OUTABS" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+                 CROSS_COMPILE=aarch64-linux-gnu- CC="$CLANG" LD="$BIN/ld.lld" NM="$BIN/llvm-nm" \
+                 OBJCOPY="$BIN/llvm-objcopy" STRIP="$BIN/llvm-strip" AR="$BIN/llvm-ar" \
+                 RANLIB="$BIN/llvm-ranlib" READELF="$BIN/llvm-readelf" HOSTCC=gcc \
                  modules_prepare 2>&1 | tail -25
             [ -f "$OUTABS/include/config/auto.conf" ] || { echo "::error::modules_prepare 之后仍无 auto.conf"; ls "$OUTABS/include/config" | head -10; exit 1; }
           fi
 
-          make -C "$COMMON" O="$OUTABS" \
+          make -C "$COMMONABS" O="$OUTABS" \
                ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
-               CC=clang LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy STRIP=llvm-strip \
-               HOSTCC=gcc \
+               CC="$CLANG" LD="$BIN/ld.lld" NM="$BIN/llvm-nm" OBJCOPY="$BIN/llvm-objcopy" \
+               STRIP="$BIN/llvm-strip" AR="$BIN/llvm-ar" RANLIB="$BIN/llvm-ranlib" \
+               READELF="$BIN/llvm-readelf" OBJDUMP="$BIN/llvm-objdump" HOSTCC=gcc \
                M="$SRC" modules 2>&1 | tee "$SRC/build.log" | tail -60
           KO="$SRC/ace5_dsi_probe.ko"
           [ -f "$KO" ] || { echo "::error::编译没产出 ace5_dsi_probe.ko（失败不算通过，不交绿灯）"; mkdir -p "$GITHUB_WORKSPACE/ace5-ko"; cp "$SRC/build.log" "$GITHUB_WORKSPACE/ace5-ko/build.log" 2>/dev/null; exit 1; }
@@ -2662,6 +2673,13 @@ jobs:
           [ "$MISSING" = 0 ] && echo "OK 所有未定义符号都有 CRC" || { echo "::error::有符号在 Module.symvers 里查不到"; exit 1; }
           echo "=== 静态核对 3：KCFI / MODVERSIONS 与目标机一致（目标机实测 CFI_CLANG=y, CFI_PERMISSIVE 未开, MODVERSIONS=y）==="
           grep -E 'CONFIG_(CFI_CLANG|CFI_PERMISSIVE|MODVERSIONS|KPROBES|MODULE_SIG_FORCE)(=| is)' "$OUT/.config" || true
+          echo "=== 静态核对 4：产物自带的编译器串必须是 17.0.2 ==="
+          # 上一轮 kbuild 悄悄用了 runner 的 Ubuntu clang 21.1.8，日志里那条 warning 才是真信号。
+          # 所以不能只看版本打印，要从 ko 的 .comment 回读生产者。
+          CMT=$("$BIN/llvm-readelf" -p .comment "$KO" 2>/dev/null | tr -s ' ')
+          echo "$CMT" | head -6
+          echo "$CMT" | grep -q 'clang version 17.0.2' || { echo "::error::ko 不是 r487747c/17.0.2 编的，KCFI 类型哈希不可信，不发"; exit 1; }
+          echo "OK ko 由 clang 17.0.2 编译"
 
           mkdir -p "$GITHUB_WORKSPACE/ace5-ko"
           cp "$KO" "$GITHUB_WORKSPACE/ace5-ko/ace5_dsi_probe.ko"

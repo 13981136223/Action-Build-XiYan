@@ -2593,11 +2593,24 @@ jobs:
           [ -s "$SYMVERS" ] || { echo "::error::缺 $SYMVERS（没有它就没有 CRC，编出来的 ko 必装不上）"; exit 1; }
           echo "内核树=$OUT  Module.symvers 行数=$(wc -l < "$SYMVERS")"
 
-          CLANG=$(find kernel_workspace/kernel_platform -maxdepth 6 -type f -path '*/bin/clang' 2>/dev/null | head -1)
-          [ -n "$CLANG" ] || { echo "::error::没找到 prebuilts clang"; exit 1; }
+          # 工具链必须是编译这颗内核用的那一套：KCFI 类型哈希随 clang 版本变。
+          # prebuilts 里 clang 的实际位置是 <prebuilts*>/clang/host/linux-x86/clang-rNNNNNNN/bin/clang
+          PB=$(find kernel_workspace/kernel_platform -maxdepth 1 -type d -name 'prebuilts*' 2>/dev/null | head -1)
+          CLANG=""
+          [ -n "$PB" ] && CLANG=$(find "$PB/clang/host/linux-x86" -maxdepth 2 -type f -name clang -path '*/bin/clang' 2>/dev/null | head -1)
+          [ -n "$CLANG" ] || CLANG=$(find kernel_workspace/kernel_platform -maxdepth 8 -type f -name clang -path '*/clang-r*/bin/clang' 2>/dev/null | head -1)
+          [ -n "$CLANG" ] || { echo "::error::没找到 prebuilts clang（prebuilts 目录=$PB）"; exit 1; }
           BIN=$(dirname "$CLANG")
           export PATH="$BIN:$PATH"
-          echo "clang=$("$CLANG" --version | head -1)"
+          V="$("$CLANG" --version | head -1)"
+          echo "clang=$V"
+          case "$V" in
+            *"clang version 17.0.2"*) ;;
+            *) echo "::error::clang 不是 17.0.2（目标内核由 r487747c/17.0.2 编），KCFI 类型哈希对不上，不发产物"; exit 1 ;;
+          esac
+          for t in ld.lld llvm-nm llvm-objcopy llvm-strip; do
+            [ -x "$BIN/$t" ] || { echo "::error::工具链缺 $t"; exit 1; }
+          done
 
           # 仓库根在构建机上会被挂载盖掉，按本次 commit 从 raw 取源码（与 CRC 那一步同一个坑）
           SRC=$(mktemp -d)
@@ -2610,10 +2623,10 @@ jobs:
           make -C "$COMMON" O="$OUT" \
                ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
                CC=clang LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy STRIP=llvm-strip \
-               PAHOLE=false HOSTCC=gcc \
-               M="$SRC" modules 2>&1 | tail -40
+               HOSTCC=gcc \
+               M="$SRC" modules 2>&1 | tee "$SRC/build.log" | tail -60
           KO="$SRC/ace5_dsi_probe.ko"
-          [ -f "$KO" ] || { echo "::error::编译没产出 ace5_dsi_probe.ko（失败不算通过，不交绿灯）"; exit 1; }
+          [ -f "$KO" ] || { echo "::error::编译没产出 ace5_dsi_probe.ko（失败不算通过，不交绿灯）"; mkdir -p "$GITHUB_WORKSPACE/ace5-ko"; cp "$SRC/build.log" "$GITHUB_WORKSPACE/ace5-ko/build.log" 2>/dev/null; exit 1; }
 
           echo "=== modinfo ==="
           modinfo "$KO" 2>&1 | grep -E '^(vermagic|name|license|description|depends)' || true
@@ -2637,7 +2650,14 @@ jobs:
 
           mkdir -p "$GITHUB_WORKSPACE/ace5-ko"
           cp "$KO" "$GITHUB_WORKSPACE/ace5-ko/ace5_dsi_probe.ko"
+          cp "$SRC/build.log" "$GITHUB_WORKSPACE/ace5-ko/build.log" 2>/dev/null || true
+          modinfo "$KO" > "$GITHUB_WORKSPACE/ace5-ko/modinfo.txt" 2>&1 || true
           sha256sum "$GITHUB_WORKSPACE/ace5-ko/ace5_dsi_probe.ko" | tee "$GITHUB_WORKSPACE/ace5-ko/sha256.txt"
+          # 顺手把 ABI 基线一起存档：以后判「这台机能不能用这个 ko」只比这三样，
+          # 不用每次重编整颗内核。全是我们自己构建的产物，不含厂商二进制。
+          cp "$SYMVERS"            "$GITHUB_WORKSPACE/ace5-ko/Module.symvers"
+          cp "$OUT/.config"        "$GITHUB_WORKSPACE/ace5-ko/kernel.config" 2>/dev/null || true
+          cp "$OUT/include/config/kernel.release" "$GITHUB_WORKSPACE/ace5-ko/kernel.release" 2>/dev/null || true
           echo "产物就绪: ace5-ko/ace5_dsi_probe.ko"
 
       - name: Upload ACE5 DSI probe ko

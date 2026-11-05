@@ -255,15 +255,15 @@ static ssize_t report_show(char *buf, const struct kernel_param *kp)
 {
 	size_t n = READ_ONCE(report_len);
 
-	if (n > PAGE_SIZE - 1)
-		n = PAGE_SIZE - 1;
+	if (n > 4000)
+		n = 4000;	/* param->get 只有一页，4000 留余量 */
 	memcpy(buf, report, n);
 	return n;
 }
 
 static ssize_t state_show(char *buf, const struct kernel_param *kp)
 {
-	return scnprintf(buf, PAGE_SIZE, "identified=%d fired=%d captured=%px from=%s report_len=%zu\n",
+	return scnprintf(buf, 4000, "identified=%d fired=%d captured=%px from=%s report_len=%zu\n",
 			 identified, fired, captured, captured_from ?: "-", READ_ONCE(report_len));
 }
 

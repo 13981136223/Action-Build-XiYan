@@ -408,15 +408,15 @@ static ssize_t report_get(char *buf, const struct kernel_param *kp)
 {
 	size_t n = READ_ONCE(report_len);
 
-	if (n > PAGE_SIZE - 1)
-		n = PAGE_SIZE - 1;
+	if (n > 4000)
+		n = 4000;	/* param->get 只有一页，4000 留余量 */
 	memcpy(buf, report, n);
 	return n;
 }
 
 static ssize_t state_get(char *buf, const struct kernel_param *kp)
 {
-	return scnprintf(buf, PAGE_SIZE,
+	return scnprintf(buf, 4000,
 			 "display=%px validated=%d installed=%d saved32=%d saved16=%d want_pclk=%u want_fps=%u\n",
 			 display, validated, installed, n32 / 2, n16 / 2, want_pclk, want_fps);
 }
@@ -441,7 +441,7 @@ static int install_set(const char *val, const struct kernel_param *kp)
 
 static ssize_t install_get(char *buf, const struct kernel_param *kp)
 {
-	return scnprintf(buf, PAGE_SIZE, "%d\n", installed ? 1 : 0);
+	return scnprintf(buf, 4000, "%d\n", installed ? 1 : 0);
 }
 
 static const struct kernel_param_ops report_ops = { .get = report_get };

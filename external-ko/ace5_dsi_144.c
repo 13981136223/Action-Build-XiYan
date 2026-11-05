@@ -366,6 +366,56 @@ static bool discover_panel(unsigned long d)
 	return false;
 }
 
+
+/* 运行时设备树侧：把选中的那条 120 timing 的两张 adfr 表首元素改成 144。
+ * 依据：一加15 样本里引用 of_get_property（只读不改结构体），并把 adfr 表
+ * 扩到 60..199；Oplus 框架在 oplus_adfr_property_update 里回读这张表，
+ * 所以只改驱动内存不够，得让 DT 侧也说 144。 */
+static int dt_adfr_rewrite(u32 fps)
+{
+	struct device_node *np, *tn, *sub;
+	int done = 0;
+
+	np = of_find_node_by_name(NULL, panel_node);
+	if (!np)
+		return -ENOENT;
+	tn = of_get_child_by_name(np, "qcom,mdss-dsi-display-timings");
+	of_node_put(np);
+	if (!tn)
+		return -ENOENT;
+	for_each_child_of_node(tn, sub) {
+		const __be32 *v;
+		int len;
+		int i;
+		static const char *const tabs[] = {
+			"oplus,adfr-high-precision-fps-mapping-table",
+			"oplus,adfr-min-fps-mapping-table",
+		};
+
+		v = of_get_property(sub, "qcom,mdss-dsi-panel-framerate", &len);
+		if (!v || len < 4 || be32_to_cpup(v) != 120)
+			continue;
+		/* 每条 120 timing 都改；驱动侧只改选中槽，DT 侧保守全改，
+		 * 免得框架按另一条 timing 的表把 144 又钳回 120 */
+		for (i = 0; i < 2; i++) {
+			__be32 *cell;
+
+			cell = (__force __be32 *)of_get_property(sub, tabs[i], &len);
+			if (!cell || len < 4)
+				continue;
+			if (be32_to_cpup(cell) != 120)
+				continue;
+			say("DT %s 首元素 120 -> %u", tabs[i], fps);
+			w32((unsigned long)cell, cpu_to_be32(fps));
+			done++;
+		}
+	}
+	of_node_put(tn);
+	if (!done)
+		say("DT 侧没改到 adfr 表（可能属性名不同）");
+	return done ? 0 : -ENOENT;
+}
+
 static int capture_display(struct kprobe *p, struct pt_regs *regs)
 {
 	unsigned long cand = regs->regs[0];
@@ -498,6 +548,7 @@ static int do_apply(void)
 			w32(p + L.adfr_off, want_fps);
 		}
 	}
+	dt_adfr_rewrite(want_fps);
 	applied = true;
 	say("已应用。验收：切一次帧率，驱动日志必须出现 fps=144 且 clk_rate=%u", want_clk);
 	return 0;

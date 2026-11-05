@@ -35,7 +35,9 @@
 
 #define TAG "ace5_144"
 #define OBJ_WIN 2048			/* dsi_display 对象扫描窗口 */
-#define MODE_WIN 768			/* 单个 mode 对象扫描窗口 */
+#define MODE_WIN 768			/* modes 指针数组校验用窗口 */
+#define FIELD_WIN 256			/* 单个 mode 内部字段扫描窗口：不得超过结构体，否则会扫进相邻对象 */
+#define COPY_MAX_OFF 0x100		/* 时钟副本只认结构体前 256 字节内的 */
 #define REPORT_CAP 3000
 
 /* 原厂 120 档指纹（迭代 1 从运行时设备树实测） */
@@ -197,7 +199,7 @@ static u32 find_khz(unsigned long base)
 {
 	u32 off;
 
-	for (off = 0; off + 4 <= MODE_WIN; off += 4) {
+	for (off = 0; off + 4 <= FIELD_WIN; off += 4) {
 		bool ok;
 		u32 v = r32(base + off, &ok);
 
@@ -251,6 +253,31 @@ static bool dt_confirm(u32 *count, u32 *n120)
 }
 
 /* 试把 dsi_display+slot 当成 modes 指针数组，逐项验证 */
+/* 某偏移是否在每条 mode 上都成立（用于剔除跨到相邻对象的偏移） */
+static bool off_holds_all(unsigned long arr, u32 count, u32 off, u32 want, u32 tol)
+{
+	u32 i;
+
+	for (i = 0; i < count; i++) {
+		bool ok;
+		unsigned long m = rptr(arr + i * 8, &ok);
+		u32 v;
+
+		if (!ok || !kern(m))
+			return false;
+		v = r32(m + off, &ok);
+		if (!ok)
+			return false;
+		if (tol) {
+			if (v + tol < want || v > want + tol)
+				return false;
+		} else if (v != want) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static bool try_modes_at(unsigned long d, u32 slot, u32 count)
 {
 	bool ok;
@@ -265,7 +292,7 @@ static bool try_modes_at(unsigned long d, u32 slot, u32 count)
 	if (!ok || !kern(m0))
 		return false;
 
-	clk_off = find_u32(m0, src_clk, MODE_WIN);
+	clk_off = find_u32(m0, src_clk, FIELD_WIN);
 	if (clk_off == U32_MAX)
 		return false;
 	/* 收集全部副本：作者把 mode_clock / mode_pixel / priv_clock 分成三个参数，
@@ -274,17 +301,17 @@ static bool try_modes_at(unsigned long d, u32 slot, u32 count)
 		u32 o;
 
 		L.clk_n = 0;
-		for (o = 0; o + 4 <= MODE_WIN && L.clk_n < 4; o += 4)
+		for (o = 0; o + 4 <= FIELD_WIN && o < COPY_MAX_OFF && L.clk_n < 4; o += 4)
 			if (is32(m0 + o, src_clk))
 				L.clk_offs[L.clk_n++] = o;
 	}
 
 	/* 帧率先在 0 号上定位（u32 优先，其次 u16） */
-	fps_off = find_u32(m0, 120, MODE_WIN);
+	fps_off = find_u32(m0, 120, FIELD_WIN);
 	if (fps_off != U32_MAX) {
 		u16 = 0;
 	} else {
-		fps_off = find_u16(m0, 120, MODE_WIN);
+		fps_off = find_u16(m0, 120, FIELD_WIN);
 		if (fps_off == U32_MAX)
 			return false;
 		u16 = 1;
@@ -320,12 +347,12 @@ static bool try_modes_at(unsigned long d, u32 slot, u32 count)
 	if (ok && kern(m0)) {
 		u32 po;
 
-		L.transfer_off = find_u32(m0, src_transfer, MODE_WIN);
+		L.transfer_off = find_u32(m0, src_transfer, FIELD_WIN);
 		L.khz_off = find_khz(m0);
 		/* priv_info：mode 内某个指针，指向的对象里也有同一个时钟值 */
 		L.priv_off = 0;
 		L.priv_clk_off = 0;
-		for (po = 0; po + 8 <= MODE_WIN && !L.priv_off; po += 8) {
+		for (po = 0; po + 8 <= FIELD_WIN && !L.priv_off; po += 8) {
 			unsigned long sub = rptr(m0 + po, &ok);
 			u32 si;
 
@@ -338,6 +365,29 @@ static bool try_modes_at(unsigned long d, u32 slot, u32 count)
 					break;
 				}
 			}
+		}
+	}
+	/* 复验与筛选：跨到相邻对象的偏移在这里被剔除 */
+	{
+		u32 keep = 0, k;
+
+		for (k = 0; k < L.clk_n; k++)
+			if (off_holds_all(arr, count, L.clk_offs[k], src_clk, 0))
+				L.clk_offs[keep++] = L.clk_offs[k];
+		if (keep != L.clk_n)
+			say("  剔除 %u 个跨对象的时钟副本偏移", L.clk_n - keep);
+		L.clk_n = keep;
+	}
+	if (L.transfer_off != U32_MAX && !off_holds_all(arr, count, L.transfer_off, src_transfer, 0)) {
+		say("  transfer_off 未在全部 mode 上成立，丢弃");
+		L.transfer_off = U32_MAX;
+	}
+	if (L.khz_off != U32_MAX) {
+		u32 khz0 = r32(m0 + L.khz_off, NULL);
+
+		if (!khz0 || !off_holds_all(arr, count, L.khz_off, khz0, 3000)) {
+			say("  drm_khz_off 未在全部 mode 上成立，丢弃");
+			L.khz_off = U32_MAX;
 		}
 	}
 	say("modes 命中 display+0x%x -> 0x%lx 条数=%u clk_off=0x%x 副本=%u priv_off=0x%x priv_clk=0x%x fps_off=0x%x(%s) 120 数=%d 槽=%d",

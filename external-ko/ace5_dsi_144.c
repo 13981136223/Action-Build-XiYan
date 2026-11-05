@@ -787,17 +787,17 @@ static const struct kernel_param_ops dump_ops = { .set = dump_set };
 module_param_cb(dump, &dump_ops, NULL, 0200);
 MODULE_PARM_DESC(dump, "写任意值把目标 mode 结构体前 384 字节打进 report");
 
-static ssize_t report_get(char *buf, const struct kernel_param *kp)
+static int report_get(char *buf, const struct kernel_param *kp)
 {
 	size_t n = READ_ONCE(report_len);
 
 	if (n > 4000)
 		n = 4000;
 	memcpy(buf, report, n);
-	return n;
+	return (int)n;
 }
 
-static ssize_t state_get(char *buf, const struct kernel_param *kp)
+static int state_get(char *buf, const struct kernel_param *kp)
 {
 	return scnprintf(buf, 4000,
 		"display=0x%lx layout=%d applied=%d probe_only=%d fail=%u slot=%d count=%u "
@@ -826,7 +826,7 @@ static int apply_set(const char *val, const struct kernel_param *kp)
 	return on ? do_apply() : do_restore();
 }
 
-static ssize_t apply_get(char *buf, const struct kernel_param *kp)
+static int apply_get(char *buf, const struct kernel_param *kp)
 {
 	return scnprintf(buf, 4000, "%d\n", applied ? 1 : 0);
 }

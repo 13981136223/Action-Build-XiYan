@@ -147,8 +147,7 @@ static void check_symbols(void)
 
 static int __init ace5_dsi_init(void)
 {
-	pr_info(MOD_TAG ": loaded, release=%s page=%lu\n",
-		init_utsname()->release, (unsigned long)PAGE_SIZE);
+	pr_info(MOD_TAG ": loaded, release=%s\n", init_utsname()->release);
 	if (strncmp(init_utsname()->release, expect_release, strlen(expect_release)))
 		pr_warn(MOD_TAG ": 内核版本与基线 %s 不一致，只读结果仅供参考\n", expect_release);
 	if (resolve_kallsyms())

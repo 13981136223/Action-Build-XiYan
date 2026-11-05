@@ -567,6 +567,32 @@ static struct kprobe kp_adfr = {
 	.symbol_name = "oplus_adfr_property_update",
 	.pre_handler = watch_adfr,
 };
+static bool adfr_hooked;
+
+/* 参照样本：ADFR 探针只在启用期间挂，撤销时解除，不常驻。 */
+static void hook_adfr(void)
+{
+	int ret;
+
+	if (adfr_hooked)
+		return;
+	ret = register_kprobe(&kp_adfr);
+	if (ret) {
+		say("ADFR 探针挂载失败 ret=%d（不影响改 mode）", ret);
+		return;
+	}
+	adfr_hooked = true;
+	say("ADFR 探针已挂（仅启用期间）");
+}
+
+static void unhook_adfr(void)
+{
+	if (!adfr_hooked)
+		return;
+	unregister_kprobe(&kp_adfr);
+	adfr_hooked = false;
+	say("ADFR 探针已撤，累计命中 %d 次", adfr_calls);
+}
 
 static unsigned long target_mode(void)
 {
@@ -683,6 +709,7 @@ static int do_apply(void)
 		}
 	}
 	dt_adfr_rewrite(want_fps);
+	hook_adfr();
 	applied = true;
 	say("已应用。验收：切一次帧率，驱动日志必须出现 fps=144 且 clk_rate=%u", want_clk);
 	return 0;
@@ -718,6 +745,7 @@ static int do_restore(void)
 		if (ok && kern(p))
 			w32(p + L.adfr_off, SAVE.adfr);
 	}
+	unhook_adfr();
 	applied = false;
 	say("已还原 mode 的 120 档原值；重启一次最彻底");
 	return 0;
@@ -859,9 +887,6 @@ static int __init ace5_144_init(void)
 		failure_code = 10;
 		return ret;
 	}
-	ret = register_kprobe(&kp_adfr);
-	if (ret)
-		say("oplus_adfr_property_update 未挂上 ret=%d（不影响改 mode）", ret);
 	say("loaded：先试 get_main_display 直接发现，失败则等显示事件");
 	try_direct_capture();
 	if (!L.display)
@@ -874,8 +899,7 @@ static void __exit ace5_144_exit(void)
 	if (applied)
 		do_restore();
 	unregister_kprobe(&kp_disp);
-	if (kp_adfr.addr)
-		unregister_kprobe(&kp_adfr);
+	unhook_adfr();
 	pr_info(TAG ": unloaded\n");
 }
 

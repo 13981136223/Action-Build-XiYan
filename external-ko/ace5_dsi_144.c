@@ -60,7 +60,11 @@ static struct {
 	unsigned long display;
 	unsigned long modes_arr;
 	u32 modes_off;
-	u32 clk_off;
+	u32 clk_off;		/* mode 内首个等于 1012000000 的字段 */
+	u32 clk_offs[4];	/* 该值的全部副本 */
+	u32 clk_n;
+	u32 priv_off;		/* mode 内指向 priv_info 的指针字段 */
+	u32 priv_clk_off;	/* priv_info 里的时钟字段 */
 	u32 fps_off;
 	u32 fps_u16;
 	u32 transfer_off;
@@ -74,6 +78,9 @@ static struct {
 static struct {
 	unsigned long mode;
 	u32 clk;
+	u32 clk_vals[4];
+	u32 clk_n;
+	u32 priv_clk;
 	u32 fps32;
 	u16 fps16;
 	u32 transfer;
@@ -261,6 +268,16 @@ static bool try_modes_at(unsigned long d, u32 slot, u32 count)
 	clk_off = find_u32(m0, src_clk, MODE_WIN);
 	if (clk_off == U32_MAX)
 		return false;
+	/* 收集全部副本：作者把 mode_clock / mode_pixel / priv_clock 分成三个参数，
+	 * 说明同一时钟在驱动里存了不止一份，只改一份可能不生效 */
+	{
+		u32 o;
+
+		L.clk_n = 0;
+		for (o = 0; o + 4 <= MODE_WIN && L.clk_n < 4; o += 4)
+			if (is32(m0 + o, src_clk))
+				L.clk_offs[L.clk_n++] = o;
+	}
 
 	/* 帧率先在 0 号上定位（u32 优先，其次 u16） */
 	fps_off = find_u32(m0, 120, MODE_WIN);
@@ -301,12 +318,31 @@ static bool try_modes_at(unsigned long d, u32 slot, u32 count)
 
 	m0 = rptr(arr + (L.slot >= 0 ? L.slot : 0) * 8, &ok);
 	if (ok && kern(m0)) {
+		u32 po;
+
 		L.transfer_off = find_u32(m0, src_transfer, MODE_WIN);
 		L.khz_off = find_khz(m0);
+		/* priv_info：mode 内某个指针，指向的对象里也有同一个时钟值 */
+		L.priv_off = 0;
+		L.priv_clk_off = 0;
+		for (po = 0; po + 8 <= MODE_WIN && !L.priv_off; po += 8) {
+			unsigned long sub = rptr(m0 + po, &ok);
+			u32 si;
+
+			if (!ok || !kern(sub) || sub == m0)
+				continue;
+			for (si = 0; si + 4 <= 256; si += 4) {
+				if (is32(sub + si, src_clk)) {
+					L.priv_off = po;
+					L.priv_clk_off = si;
+					break;
+				}
+			}
+		}
 	}
-	say("modes 数组命中：display+0x%x -> 0x%lx 条数=%u clk_off=0x%x fps_off=0x%x(%s) 120 数=%d 目标槽=%d",
-	    L.modes_off, L.modes_arr, L.count, L.clk_off, L.fps_off, L.fps_u16 ? "u16" : "u32",
-	    n120, L.slot);
+	say("modes 命中 display+0x%x -> 0x%lx 条数=%u clk_off=0x%x 副本=%u priv_off=0x%x priv_clk=0x%x fps_off=0x%x(%s) 120 数=%d 槽=%d",
+	    L.modes_off, L.modes_arr, L.count, L.clk_off, L.clk_n, L.priv_off, L.priv_clk_off,
+	    L.fps_off, L.fps_u16 ? "u16" : "u32", n120, L.slot);
 	if (L.transfer_off != U32_MAX)
 		say("  transfer_off=0x%x", L.transfer_off);
 	if (L.khz_off != U32_MAX)
@@ -464,6 +500,7 @@ static unsigned long target_mode(void)
 static int save_original(unsigned long m)
 {
 	bool ok;
+	int i;
 
 	SAVE.mode = m;
 	SAVE.clk = r32(m + L.clk_off, &ok);
@@ -471,6 +508,16 @@ static int save_original(unsigned long m)
 		say("目标槽当前 clk=%u 不是 %u，拒绝写", SAVE.clk, src_clk);
 		failure_code = 6;
 		return -EIO;
+	}
+	SAVE.clk_n = L.clk_n;
+	for (i = 0; i < (int)L.clk_n && i < 4; i++)
+		SAVE.clk_vals[i] = r32(m + L.clk_offs[i], NULL);
+	SAVE.priv_clk = 0;
+	if (L.priv_off) {
+		unsigned long sub = rptr(m + L.priv_off, &ok);
+
+		if (ok && kern(sub))
+			SAVE.priv_clk = r32(sub + L.priv_clk_off, NULL);
 	}
 	if (L.fps_u16) {
 		u16 v = 0;
@@ -504,7 +551,7 @@ static int do_apply(void)
 {
 	unsigned long m;
 	u32 khz_new;
-	int ret;
+	int ret, i;
 
 	if (probe_only) {
 		say("probe_only=1，拒绝对内存做任何改动");
@@ -527,6 +574,17 @@ static int do_apply(void)
 
 	say("写入 mode=%px：clk %u->%u，fps->%u", m, SAVE.clk, want_clk, want_fps);
 	w32(m + L.clk_off, want_clk);
+	for (i = 0; i < (int)L.clk_n && i < 4; i++)
+		w32(m + L.clk_offs[i], want_clk);
+	if (L.priv_off && SAVE.priv_clk == src_clk) {
+		bool pok;
+		unsigned long sub = rptr(m + L.priv_off, &pok);
+
+		if (pok && kern(sub)) {
+			say("  priv_info 时钟 %u -> %u", SAVE.priv_clk, want_clk);
+			w32(sub + L.priv_clk_off, want_clk);
+		}
+	}
 	if (L.fps_u16)
 		w16(m + L.fps_off, (u16)want_fps);
 	else
@@ -557,10 +615,21 @@ static int do_apply(void)
 static int do_restore(void)
 {
 	unsigned long m = target_mode();
+	int i;
 
 	if (!saved || !m)
 		return 0;
 	w32(m + L.clk_off, SAVE.clk);
+	for (i = 0; i < (int)SAVE.clk_n && i < 4; i++)
+		if (SAVE.clk_vals[i])
+			w32(m + L.clk_offs[i], SAVE.clk_vals[i]);
+	if (L.priv_off && SAVE.priv_clk) {
+		bool pok;
+		unsigned long sub = rptr(m + L.priv_off, &pok);
+
+		if (pok && kern(sub))
+			w32(sub + L.priv_clk_off, SAVE.priv_clk);
+	}
 	if (L.fps_u16)
 		w16(m + L.fps_off, SAVE.fps16);
 	else
@@ -596,10 +665,10 @@ static ssize_t state_get(char *buf, const struct kernel_param *kp)
 	return scnprintf(buf, 4000,
 		"display=0x%lx layout=%d applied=%d probe_only=%d fail=%u slot=%d count=%u "
 		"modes_off=0x%x arr=0x%lx clk_off=0x%x fps_off=0x%x(%s) transfer_off=0x%x "
-		"khz_off=0x%x panel_off=0x%x adfr_off=0x%x adfr_calls=%d\n",
+		"khz_off=0x%x panel_off=0x%x adfr_off=0x%x clk_n=%u priv_off=0x%x priv_clk_off=0x%x adfr_calls=%d\n",
 		L.display, layout_ok, applied, probe_only, failure_code, L.slot, L.count,
 		L.modes_off, L.modes_arr, L.clk_off, L.fps_off, L.fps_u16 ? "u16" : "u32",
-		L.transfer_off, L.khz_off, L.panel_off, L.adfr_off, adfr_calls);
+		L.transfer_off, L.khz_off, L.panel_off, L.adfr_off, L.clk_n, L.priv_off, L.priv_clk_off, adfr_calls);
 }
 
 static int state_set(const char *val, const struct kernel_param *kp)

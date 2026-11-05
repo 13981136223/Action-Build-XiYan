@@ -2620,7 +2620,22 @@ jobs:
           grep -q 'obj-m += ace5_dsi_probe.o' "$SRC/Makefile" || { echo "::error::取回的 Makefile 内容不对"; exit 1; }
           echo "模块源码就位: $SRC ($(wc -c < "$SRC/ace5_dsi_probe.c") 字节)"
 
-          make -C "$COMMON" O="$OUT" \
+          # out 是 bazel 铺出来的树：Module.symvers / include/config/kernel.release 在，
+          # 但 include/config/auto.conf 可能没有，kbuild 不认。缺就补 modules_prepare。
+          OUTABS=$(cd "$OUT" && pwd)
+          echo "out 绝对路径=$OUTABS"
+          ls -l "$OUTABS/include/config/auto.conf" 2>&1 | head -2
+          if [ ! -f "$OUTABS/include/config/auto.conf" ]; then
+            echo "auto.conf 缺失 → 补 modules_prepare"
+            [ -f "$OUTABS/.config" ] || { echo "::error::连 .config 都没有，无法 prepare"; exit 1; }
+            make -C "$COMMON" O="$OUTABS" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+                 CROSS_COMPILE=aarch64-linux-gnu- CC=clang LD=ld.lld NM=llvm-nm \
+                 OBJCOPY=llvm-objcopy STRIP=llvm-strip HOSTCC=gcc \
+                 modules_prepare 2>&1 | tail -25
+            [ -f "$OUTABS/include/config/auto.conf" ] || { echo "::error::modules_prepare 之后仍无 auto.conf"; ls "$OUTABS/include/config" | head -10; exit 1; }
+          fi
+
+          make -C "$COMMON" O="$OUTABS" \
                ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
                CC=clang LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy STRIP=llvm-strip \
                HOSTCC=gcc \
@@ -2660,6 +2675,22 @@ jobs:
           cp "$OUT/include/config/kernel.release" "$GITHUB_WORKSPACE/ace5-ko/kernel.release" 2>/dev/null || true
           echo "产物就绪: ace5-ko/ace5_dsi_probe.ko"
 
+          # 把这棵 out 树里编外部模块所需的部分另存一份：以后编 ko 只要解开它，
+          # 不必再花一小时重编整颗内核（机型矩阵的基础）。超过 400MB 就不带，避免撞产物上限。
+          mkdir -p "$GITHUB_WORKSPACE/ace5-out"
+          TAR="$GITHUB_WORKSPACE/ace5-out/outtree.tar.gz"
+          tar -czf "$TAR" -C "$OUTABS" \
+              .config Module.symvers Makefile System.map \
+              include scripts arch/arm64/include arch/arm64/boot/dts/include 2>/dev/null || \
+          tar -czf "$TAR" -C "$OUTABS" .config Module.symvers Makefile include scripts 2>/dev/null || true
+          if [ -s "$TAR" ]; then
+            SZ=$(stat -c %s "$TAR")
+            echo "out 树打包 $((SZ/1024/1024)) MB"
+            [ "$SZ" -le 419430400 ] || { echo "超过 400MB，不带这份产物"; rm -f "$TAR"; }
+          else
+            rm -f "$TAR"
+          fi
+
       - name: Upload ACE5 DSI probe ko
         if: always()
         uses: actions/upload-artifact@v7
@@ -2667,6 +2698,14 @@ jobs:
           name: ace5-dsi-probe-ko-${{ steps.extract_info.outputs.value }}
           retention-days: 7
           path: ./ace5-ko/*
+
+      - name: Upload ACE5 kernel out tree subset
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ace5-outtree-${{ steps.extract_info.outputs.value }}
+          retention-days: 3
+          path: ./ace5-out/*
 
       - name: Collect Oplus scheduler modules
         id: sched_mod

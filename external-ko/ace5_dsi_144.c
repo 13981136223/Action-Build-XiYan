@@ -600,16 +600,12 @@ static int save_original(unsigned long m)
 		if (ok && kern(sub))
 			SAVE.priv_clk = r32(sub + L.priv_clk_off, NULL);
 	}
-	if (L.fps_u16) {
+	{
 		u16 v = 0;
 
 		if (rd(m + L.fps_off, &v, sizeof(v)))
 			return -EIO;
 		SAVE.fps16 = v;
-	} else {
-		SAVE.fps32 = r32(m + L.fps_off, &ok);
-		if (!ok)
-			return -EIO;
 	}
 	if (L.transfer_off != U32_MAX)
 		SAVE.transfer = r32(m + L.transfer_off, NULL);
@@ -666,10 +662,9 @@ static int do_apply(void)
 			w32(sub + L.priv_clk_off, want_clk);
 		}
 	}
-	if (L.fps_u16)
-		w16(m + L.fps_off, (u16)want_fps);
-	else
-		w32(m + L.fps_off, want_fps);
+	/* 一律只写 2 字节：即便它其实是 u32（高半为 0），结果等价；
+	 * 而若它真是 u16，写 4 字节会踩坏后面那个字段。 */
+	w16(m + L.fps_off, (u16)want_fps);
 	if (L.transfer_off != U32_MAX && SAVE.transfer == src_transfer)
 		w32(m + L.transfer_off, want_transfer);
 	if (L.khz_off != U32_MAX && SAVE.khz) {
@@ -711,10 +706,7 @@ static int do_restore(void)
 		if (pok && kern(sub))
 			w32(sub + L.priv_clk_off, SAVE.priv_clk);
 	}
-	if (L.fps_u16)
-		w16(m + L.fps_off, SAVE.fps16);
-	else
-		w32(m + L.fps_off, SAVE.fps32);
+	w16(m + L.fps_off, SAVE.fps16);
 	if (L.transfer_off != U32_MAX && SAVE.transfer)
 		w32(m + L.transfer_off, SAVE.transfer);
 	if (L.khz_off != U32_MAX && SAVE.khz)

@@ -1,17 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * ace5_dsi_144.c — 迭代 3：运行时注入 144Hz
+ * ace5_dsi_144.c — 一加 Ace 5 运行时开启 144Hz（不刷 dtbo）
  *
- * 配方来自修改版 dtbo 与原厂 dtbo 的逐属性对比：144 相对 120 只改
- * framerate / panel-clockrate / mdp-transfer-time-us / 两张 LTPO adfr 映射表首元素，
- * DSC、porch 总和、DDIC 命令表一字节不动。
+ * 配方来自原厂 dtbo 与修改版 dtbo 的逐属性对比：144 相对 120 只改
+ *   panel-framerate       120 -> 144
+ *   panel-clockrate  1012000000 -> 1239700000   (x1.2250)
+ *   mdp-transfer-time-us      6290 -> 5205
+ *   两张 LTPO adfr 映射表首元素 120 -> 144
+ * DSC 参数、porch、DDIC 命令表一字不动。
  *
- * 不刷 dtbo：抓活的 struct dsi_display，把原生 120 档那条 mode 的时钟与帧率字段
- * 改写成 144 的值。厂商结构体没开源，偏移一律由 insmod 参数传入，写之前每个偏移
- * 都要读到"应有值"，对不上就拒绝写。
+ * 手法参照一加15 同类 ko（oneplus15_display_165_180_auto：只引用 26 个内核符号，
+ * 不碰 DRM 接口，运行时定位 dsi_display 布局后改 mode，并把 ADFR 钳在
+ * oplus_adfr_property_update 上）。字段偏移不写死，靠四条 timing 的天然指纹
+ * 现场发现：DSI 时钟全等 1012000000、帧率序列含两条 120、drm clock 约
+ * 455817kHz、panel 内 adfr 表 120/90/72/60。发现不了就拒改。
  *
- * 过程与状态走 /sys/module/ace5_dsi_144/parameters/{report,state,install}
- * —— 这台机 dmesg 刷得极快，不能只靠日志。
+ * 原厂 DT 本来就有两条 120（sdc_fhd_120 与 oplus_fhd_120，DRM 模式表也是
+ * 120/60/90/120），所以把**最后一条 120** 改写成 144：不扩数组、不改计数，
+ * 原生 120 仍可回退，风险面最小。
+ *
+ * 默认 probe_only=1：只发现不写内存。确认 state 后才 echo 0 > probe_only，
+ * 再 echo 1 > apply。过程写进 parameters/report（这台机 dmesg 冲得极快）。
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -22,51 +31,67 @@
 #include <linux/string.h>
 #include <linux/err.h>
 #include <linux/spinlock.h>
+#include <linux/of.h>
 
 #define TAG "ace5_144"
-#define WIN 2048
-#define SUBWIN 256
-#define REPORT_CAP 2600
-#define PTRSZ 8			/* modes 是指针数组，步长恒 8 */
+#define OBJ_WIN 2048			/* dsi_display 对象扫描窗口 */
+#define MODE_WIN 768			/* 单个 mode 对象扫描窗口 */
+#define REPORT_CAP 3000
 
-static const char panel_prefix[] = "qcom,mdss_dsi_panel";
+/* 原厂 120 档指纹（迭代 1 从运行时设备树实测） */
+static u32 src_clk = 1012000000;
+static u32 src_transfer = 6290;
+static u32 src_pix_khz = 455817;	/* (1264+54)*(2780+102)*120/1000 */
+static u32 src_adfr[4] = { 120, 90, 72, 60 };
 
-/* 原生 120 档已知真值（迭代 1 实测），用于验偏移 */
-static u32 expect_pclk = 1012000000;
-static u32 expect_transfer = 6290;
-static u32 expect_fps = 120;
-static u32 expect_modes = 4;
-
-/* 144 档目标值（来自修改版 dtbo） */
-static u32 want_pclk = 1239700000;	/* 0x49e45220 */
-static u32 want_transfer = 5205;	/* 0x1455 */
+/* 144 档目标 */
+static u32 want_clk = 1239700000;
 static u32 want_fps = 144;
+static u32 want_transfer = 5205;
 
-static u64 off_panel;		/* dsi_display -> struct dsi_panel * */
-static u64 off_num_modes;	/* dsi_display -> u32 modes_count */
-static u64 off_modes;		/* dsi_display -> struct dsi_display_mode **modes */
-static u64 off_mode_pclk;	/* mode -> u32 pclk */
-static u64 off_mode_transfer;	/* mode -> u32 transfer_time_us */
-static u64 off_mode_vrefresh;	/* mode -> drm_display_mode.vrefresh（u16） */
-static u64 off_mode_clock;	/* mode -> drm_display_mode.clock（u32, kHz） */
-static u64 off_adfr_hi;		/* panel -> adfr high-precision 表首元素 */
-static u64 off_adfr_min;	/* panel -> adfr min 表首元素 */
+static bool probe_only = true;
+static bool applied;
+static bool layout_ok;
+static u32 failure_code;
+static int want_slot = -1;		/* -1 = 自动选最后一条 120 */
+static char panel_node[64] = "qcom,mdss_dsi_panel_AA577_P_3_A0020_dsc_cmd";
+
+static struct {
+	unsigned long display;
+	unsigned long modes_arr;
+	u32 modes_off;
+	u32 clk_off;
+	u32 fps_off;
+	u32 fps_u16;
+	u32 transfer_off;
+	u32 khz_off;
+	u32 panel_off;
+	u32 adfr_off;
+	u32 count;
+	int slot;
+} L;
+
+static struct {
+	unsigned long mode;
+	u32 clk;
+	u32 fps32;
+	u16 fps16;
+	u32 transfer;
+	u32 khz;
+	u32 adfr;
+	bool have_adfr;
+} SAVE;
+static bool saved;
+static int adfr_calls;
 
 static char report[REPORT_CAP];
 static size_t report_len;
 static DEFINE_SPINLOCK(report_lock);
 
-static void *display;
-static bool validated;
-static bool installed;
-static u64 saved32[24];
-static u64 saved16[8];
-static int n32, n16;
-
 __printf(1, 2)
 static void say(const char *fmt, ...)
 {
-	char line[160];
+	char line[180];
 	va_list ap;
 	unsigned long flags;
 	int n;
@@ -86,321 +111,422 @@ static void say(const char *fmt, ...)
 	spin_unlock_irqrestore(&report_lock, flags);
 }
 
-static bool kern_addr(unsigned long a)
+static bool kern(unsigned long a)
 {
 	return (long)a < 0 && !IS_ERR((void *)a);
 }
 
-static int rd(unsigned long addr, void *buf, size_t len)
+static int rd(unsigned long a, void *buf, size_t len)
 {
-	if (!kern_addr(addr))
+	if (!kern(a))
 		return -EINVAL;
-	return copy_from_kernel_nofault(buf, (void *)addr, len);
+	return copy_from_kernel_nofault(buf, (void *)a, len);
 }
 
-/* 只写此前用 nofault 读成功过的同一地址；copy_to_kernel_nofault 在 6.1 未导出 */
-static int wr(unsigned long addr, const void *buf, size_t len)
-{
-	if (!kern_addr(addr))
-		return -EINVAL;
-	memcpy((void *)addr, buf, len);
-	return 0;
-}
-
-static u32 rd_u32(unsigned long addr, bool *ok)
+static u32 r32(unsigned long a, bool *ok)
 {
 	u32 v = 0;
-	int ret = rd(addr, &v, sizeof(v));
+	int ret = rd(a, &v, sizeof(v));
 
 	if (ok)
 		*ok = !ret;
 	return ret ? 0 : v;
 }
 
-static bool name_inside(unsigned long a, int win)
+static unsigned long rptr(unsigned long a, bool *ok)
 {
-	int off;
+	u64 v = 0;
+	int ret = rd(a, &v, sizeof(v));
 
-	for (off = 0; off + 8 <= win; off += 8) {
-		char probe[40];
+	if (ok)
+		*ok = !ret;
+	return ret ? 0 : (unsigned long)v;
+}
 
-		if (rd(a + off, probe, sizeof(probe)))
-			continue;
-		probe[sizeof(probe) - 1] = '\0';
-		if (!strncmp(probe, panel_prefix, strlen(panel_prefix)))
-			return true;
+/* 只写发现阶段已经读成功过的地址；6.1 未导出 copy_to_kernel_nofault */
+static void w32(unsigned long a, u32 v)
+{
+	if (kern(a))
+		memcpy((void *)a, &v, sizeof(v));
+}
+
+static void w16(unsigned long a, u16 v)
+{
+	if (kern(a))
+		memcpy((void *)a, &v, sizeof(v));
+}
+
+static bool is32(unsigned long a, u32 key)
+{
+	bool ok;
+
+	return r32(a, &ok) == key && ok;
+}
+
+static u32 find_u32(unsigned long base, u32 key, u32 win)
+{
+	u32 off;
+
+	for (off = 0; off + 4 <= win; off += 4)
+		if (is32(base + off, key))
+			return off;
+	return U32_MAX;
+}
+
+static u32 find_u16(unsigned long base, u32 key, u32 win)
+{
+	u32 off;
+
+	for (off = 0; off + 2 <= win; off += 2) {
+		u16 v = 0;
+
+		if (!rd(base + off, &v, sizeof(v)) && v == (u16)key)
+			return off;
 	}
+	return U32_MAX;
+}
+
+static u32 find_khz(unsigned long base)
+{
+	u32 off;
+
+	for (off = 0; off + 4 <= MODE_WIN; off += 4) {
+		bool ok;
+		u32 v = r32(base + off, &ok);
+
+		if (ok && v > src_pix_khz - 3000 && v < src_pix_khz + 3000)
+			return off;
+	}
+	return U32_MAX;
+}
+
+/* 读某条 mode 的帧率字段 */
+static u32 mode_fps(unsigned long m, u32 off, u32 u16, bool *ok)
+{
+	if (u16) {
+		u16 v = 0;
+
+		*ok = !rd(m + off, &v, sizeof(v));
+		return v;
+	}
+	return r32(m + off, ok);
+}
+
+/* 设备树侧的二次确认：必须有两条 120，才谈得上把其中一条变成 144 */
+static bool dt_confirm(u32 *count, u32 *n120)
+{
+	struct device_node *np, *tn, *sub;
+	u32 c = 0, hit = 0;
+
+	np = of_find_node_by_name(NULL, panel_node);
+	if (!np) {
+		say("设备树找不到 %s", panel_node);
+		return false;
+	}
+	tn = of_get_child_by_name(np, "qcom,mdss-dsi-display-timings");
+	of_node_put(np);
+	if (!tn) {
+		say("面板节点无 display-timings");
+		return false;
+	}
+	for_each_child_of_node(tn, sub) {
+		u32 v;
+
+		c++;
+		if (!of_property_read_u32(sub, "qcom,mdss-dsi-panel-framerate", &v) && v == 120)
+			hit++;
+	}
+	of_node_put(tn);
+	*count = c;
+	*n120 = hit;
+	say("设备树确认：timing=%u 其中 120 档=%u", c, hit);
+	return c > 0 && hit >= 2;
+}
+
+/* 试把 dsi_display+slot 当成 modes 指针数组，逐项验证 */
+static bool try_modes_at(unsigned long d, u32 slot, u32 count)
+{
+	bool ok;
+	unsigned long arr = rptr(d + slot, &ok);
+	unsigned long m0;
+	u32 i, clk_off, fps_off, u16 = 0;
+	int last120 = -1, n120 = 0;
+
+	if (!ok || !kern(arr))
+		return false;
+	m0 = rptr(arr, &ok);
+	if (!ok || !kern(m0))
+		return false;
+
+	clk_off = find_u32(m0, src_clk, MODE_WIN);
+	if (clk_off == U32_MAX)
+		return false;
+
+	/* 帧率先在 0 号上定位（u32 优先，其次 u16） */
+	fps_off = find_u32(m0, 120, MODE_WIN);
+	if (fps_off != U32_MAX) {
+		u16 = 0;
+	} else {
+		fps_off = find_u16(m0, 120, MODE_WIN);
+		if (fps_off == U32_MAX)
+			return false;
+		u16 = 1;
+	}
+
+	for (i = 0; i < count; i++) {
+		unsigned long m = rptr(arr + i * 8, &ok);
+		bool fok;
+		u32 f;
+
+		if (!ok || !kern(m))
+			return false;
+		if (!is32(m + clk_off, src_clk))
+			return false;
+		f = mode_fps(m, fps_off, u16, &fok);
+		if (!fok)
+			return false;
+		if (f == 120) {
+			n120++;
+			last120 = i;
+		}
+	}
+
+	L.modes_off = slot;
+	L.modes_arr = arr;
+	L.clk_off = clk_off;
+	L.fps_off = fps_off;
+	L.fps_u16 = u16;
+	L.count = count;
+	L.slot = want_slot >= 0 && want_slot < (int)count ? want_slot : last120;
+
+	m0 = rptr(arr + (L.slot >= 0 ? L.slot : 0) * 8, &ok);
+	if (ok && kern(m0)) {
+		L.transfer_off = find_u32(m0, src_transfer, MODE_WIN);
+		L.khz_off = find_khz(m0);
+	}
+	say("modes 数组命中：display+0x%x -> 0x%lx 条数=%u clk_off=0x%x fps_off=0x%x(%s) 120 数=%d 目标槽=%d",
+	    L.modes_off, L.modes_arr, L.count, L.clk_off, L.fps_off, L.fps_u16 ? "u16" : "u32",
+	    n120, L.slot);
+	if (L.transfer_off != U32_MAX)
+		say("  transfer_off=0x%x", L.transfer_off);
+	if (L.khz_off != U32_MAX)
+		say("  drm_khz_off=0x%x", L.khz_off);
+	return L.slot >= 0;
+}
+
+static bool discover_layout(unsigned long d, u32 count)
+{
+	u32 slot;
+
+	for (slot = 0; slot + 8 <= OBJ_WIN; slot += 8)
+		if (try_modes_at(d, slot, count))
+			return true;
+	say("没能在 dsi_display 里定位 modes 数组（count=%u）", count);
+	failure_code = 1;
 	return false;
 }
 
-static int try_capture(struct kprobe *p, struct pt_regs *regs)
+static bool discover_panel(unsigned long d)
+{
+	u32 slot, in;
+
+	for (slot = 0; slot + 8 <= OBJ_WIN; slot += 8) {
+		bool ok;
+		unsigned long p = rptr(d + slot, &ok);
+		char probe[40];
+		bool named = false;
+
+		if (!ok || !kern(p))
+			continue;
+		for (in = 0; in + 8 <= MODE_WIN; in += 8) {
+			if (rd(p + in, probe, sizeof(probe)))
+				continue;
+			probe[sizeof(probe) - 1] = '\0';
+			if (!strncmp(probe, "qcom,mdss_dsi_panel", 19)) {
+				named = true;
+				break;
+			}
+		}
+		if (!named)
+			continue;
+
+		L.panel_off = slot;
+		for (in = 0; in + 16 <= MODE_WIN; in += 4) {
+			if (is32(p + in, src_adfr[0]) && is32(p + in + 4, src_adfr[1]) &&
+			    is32(p + in + 8, src_adfr[2]) && is32(p + in + 12, src_adfr[3])) {
+				L.adfr_off = in;
+				break;
+			}
+		}
+		say("panel：display+0x%x -> 0x%lx，adfr 高刷表偏移=0x%x",
+		    slot, p, L.adfr_off);
+		return true;
+	}
+	say("没找到 panel 指针（可选功能，不影响改 mode）");
+	return false;
+}
+
+static int capture_display(struct kprobe *p, struct pt_regs *regs)
 {
 	unsigned long cand = regs->regs[0];
-	unsigned long flags;
-	bool fresh = false;
+	u32 count = 4, n120 = 0;
 
-	if (READ_ONCE(display))
+	if (READ_ONCE(L.display))
 		return 0;
-	if (!kern_addr(cand))
+	if (!kern(cand))
 		return 0;
-	{
-		int off;
-		bool hit = false;
-
-		for (off = 0; off + 8 <= WIN && !hit; off += 8) {
-			unsigned long val;
-
-			if (rd(cand + off, &val, sizeof(val)))
-				continue;
-			if (kern_addr(val) && name_inside(val, SUBWIN))
-				hit = true;
-		}
-		if (!hit)
-			return 0;
-	}
-	spin_lock_irqsave(&report_lock, flags);
-	if (!display) {
-		display = (void *)cand;
-		fresh = true;
-	}
-	spin_unlock_irqrestore(&report_lock, flags);
-	if (fresh)
-		say("抓到 dsi_display 0x%lx", cand);
+	if (!dt_confirm(&count, &n120))
+		return 0;
+	if (!discover_layout(cand, count))
+		return 0;
+	L.display = cand;
+	layout_ok = true;
+	discover_panel(cand);
+	say("布局发现完成，probe_only=%d", probe_only);
 	return 0;
 }
 
-static struct kprobe kp = {
+static int watch_adfr(struct kprobe *p, struct pt_regs *regs)
+{
+	adfr_calls++;		/* 一期只观测，不猜参数语义 */
+	return 0;
+}
+
+static struct kprobe kp_disp = {
 	.symbol_name = "dsi_display_prepare",
-	.pre_handler = try_capture,
+	.pre_handler = capture_display,
+};
+static struct kprobe kp_adfr = {
+	.symbol_name = "oplus_adfr_property_update",
+	.pre_handler = watch_adfr,
 };
 
-static void save32(unsigned long addr, u32 old)
+static unsigned long target_mode(void)
 {
-	if (n32 + 2 > (int)ARRAY_SIZE(saved32)) {
-		say("32 位保存表已满，后续改动无法回滚");
-		return;
-	}
-	saved32[n32++] = addr;
-	saved32[n32++] = old;
+	bool ok;
+	unsigned long m = rptr(L.modes_arr + L.slot * 8, &ok);
+
+	if (!ok || !kern(m))
+		return 0;
+	return m;
 }
 
-static void save16(unsigned long addr, u16 old)
+static int save_original(unsigned long m)
 {
-	if (n16 + 2 > (int)ARRAY_SIZE(saved16)) {
-		say("16 位保存表已满");
-		return;
+	bool ok;
+
+	SAVE.mode = m;
+	SAVE.clk = r32(m + L.clk_off, &ok);
+	if (!ok || SAVE.clk != src_clk) {
+		say("目标槽当前 clk=%u 不是 %u，拒绝写", SAVE.clk, src_clk);
+		failure_code = 6;
+		return -EIO;
 	}
-	saved16[n16++] = addr;
-	saved16[n16++] = old;
-}
+	if (L.fps_u16) {
+		u16 v = 0;
 
-static int resolve(unsigned long *panel_out, unsigned long *modes_out)
-{
-	unsigned long d = (unsigned long)display, panel, modes;
+		if (rd(m + L.fps_off, &v, sizeof(v)))
+			return -EIO;
+		SAVE.fps16 = v;
+	} else {
+		SAVE.fps32 = r32(m + L.fps_off, &ok);
+		if (!ok)
+			return -EIO;
+	}
+	if (L.transfer_off != U32_MAX)
+		SAVE.transfer = r32(m + L.transfer_off, NULL);
+	if (L.khz_off != U32_MAX)
+		SAVE.khz = r32(m + L.khz_off, NULL);
+	SAVE.have_adfr = false;
+	if (L.panel_off && L.adfr_off != U32_MAX) {
+		unsigned long p = rptr(L.display + L.panel_off, &ok);
 
-	if (!d)
-		return -ENOENT;
-	if (rd(d + off_panel, &panel, sizeof(panel)) || !kern_addr(panel))
-		return -EINVAL;
-	if (rd(d + off_modes, &modes, sizeof(modes)) || !kern_addr(modes))
-		return -EINVAL;
-	*panel_out = panel;
-	*modes_out = modes;
+		if (ok && kern(p)) {
+			SAVE.adfr = r32(p + L.adfr_off, NULL);
+			SAVE.have_adfr = (SAVE.adfr == src_adfr[0]);
+		}
+	}
+	saved = true;
 	return 0;
 }
 
-static bool validate_offsets(void)
+static int do_apply(void)
 {
-	unsigned long panel, modes, mode0, d = (unsigned long)display;
-	bool ok;
-	u32 v;
-	int i;
+	unsigned long m;
+	u32 khz_new;
+	int ret;
 
-	if (!display) {
-		say("还没抓到 display；先息屏亮屏一次再读 parameters/state");
-		return false;
+	if (probe_only) {
+		say("probe_only=1，拒绝对内存做任何改动");
+		failure_code = 2;
+		return -EPERM;
 	}
-	if (!off_panel || !off_modes || !off_num_modes || !off_mode_pclk) {
-		say("必填偏移缺失：off_panel/off_modes/off_num_modes/off_mode_pclk");
-		return false;
+	if (!layout_ok || L.slot < 0) {
+		say("还没有布局；息屏亮屏一次让 dsi_display_prepare 被调到，再读 state");
+		failure_code = 3;
+		return -ENOENT;
 	}
-	if (resolve(&panel, &modes)) {
-		say("off_panel/off_modes 取不到 panel/modes");
-		return false;
-	}
-	if (!name_inside(panel, SUBWIN)) {
-		say("off_panel 指过去认不出面板名，偏移不对");
-		return false;
-	}
-
-	v = rd_u32(d + off_num_modes, &ok);
-	if (!ok || v != expect_modes) {
-		say("off_num_modes=0x%llx 读到 %u，期望 4 → 拒绝", off_num_modes, v);
-		return false;
-	}
-	if (rd(modes, &mode0, sizeof(mode0)) || !kern_addr(mode0)) {
-		say("modes[0] 不是有效指针");
-		return false;
-	}
-	v = rd_u32(mode0 + off_mode_pclk, &ok);
-	if (!ok || v != expect_pclk) {
-		say("off_mode_pclk=0x%llx 读到 %u，期望 %u → 拒绝",
-		    off_mode_pclk, v, expect_pclk);
-		return false;
-	}
-	if (off_mode_transfer) {
-		v = rd_u32(mode0 + off_mode_transfer, &ok);
-		if (!ok || v != expect_transfer) {
-			say("off_mode_transfer=0x%llx 读到 %u，期望 %u → 拒绝",
-			    off_mode_transfer, v, expect_transfer);
-			return false;
-		}
-	}
-	if (off_mode_vrefresh) {
-		u16 vr = 0;
-
-		if (rd(mode0 + off_mode_vrefresh, &vr, sizeof(vr)) || vr != expect_fps) {
-			say("off_mode_vrefresh=0x%llx 读到 %u，期望 120 → 拒绝",
-			    off_mode_vrefresh, vr);
-			return false;
-		}
-	}
-	if (off_adfr_hi) {
-		v = rd_u32(panel + off_adfr_hi, &ok);
-		if (!ok || v != expect_fps) {
-			say("off_adfr_hi=0x%llx 读到 %u，期望 120 → 拒绝", off_adfr_hi, v);
-			return false;
-		}
-	}
-	if (off_adfr_min) {
-		v = rd_u32(panel + off_adfr_min, &ok);
-		if (!ok || v != expect_fps) {
-			say("off_adfr_min=0x%llx 读到 %u，期望 120 → 拒绝", off_adfr_min, v);
-			return false;
-		}
-	}
-	for (i = 0; i < (int)expect_modes; i++) {
-		unsigned long m;
-		bool m_ok;
-
-		if (rd(modes + i * PTRSZ, &m, sizeof(m)) || !kern_addr(m))
-			continue;
-		v = rd_u32(m + off_mode_pclk, &m_ok);
-		if (m_ok && v == expect_pclk)
-			say("modes[%d]=0x%lx 是原生 120 档（pclk 对得上）", i, m);
-	}
-
-	say("偏移全部验过：display=%px panel=0x%lx modes=0x%lx", display, panel, modes);
-	validated = true;
-	return true;
-}
-
-static int do_install(void)
-{
-	unsigned long panel, modes, mode;
-	int i, changed = 0;
-
-	if (!validated && !validate_offsets())
-		return -EINVAL;
-	if (resolve(&panel, &modes))
+	m = target_mode();
+	if (!m) {
+		failure_code = 5;
 		return -EFAULT;
-
-	for (i = 0; i < (int)expect_modes; i++) {
-		bool ok;
-		u32 pclk;
-
-		if (rd(modes + i * PTRSZ, &mode, sizeof(mode)) || !kern_addr(mode))
-			continue;
-		pclk = rd_u32(mode + off_mode_pclk, &ok);
-		if (!ok || pclk != expect_pclk)
-			continue;
-
-		say("改写 modes[%d]=0x%lx pclk %u -> %u", i, mode, pclk, want_pclk);
-		save32(mode + off_mode_pclk, pclk);
-		if (wr(mode + off_mode_pclk, &want_pclk, sizeof(want_pclk))) {
-			say("写 pclk 失败");
-			return -EIO;
-		}
-		changed++;
-
-		if (off_mode_transfer) {
-			u32 t = rd_u32(mode + off_mode_transfer, &ok);
-
-			if (ok && t == expect_transfer) {
-				save32(mode + off_mode_transfer, t);
-				wr(mode + off_mode_transfer, &want_transfer,
-				   sizeof(want_transfer));
-			}
-		}
-		if (off_mode_clock) {
-			u32 c = rd_u32(mode + off_mode_clock, &ok);
-
-			if (ok && c) {
-				u32 wc = (u32)((u64)c * want_fps / expect_fps);
-
-				save32(mode + off_mode_clock, c);
-				wr(mode + off_mode_clock, &wc, sizeof(wc));
-				say("  clock %u -> %u kHz", c, wc);
-			}
-		}
-		if (off_mode_vrefresh) {
-			u16 vr = 0, wv = (u16)want_fps;
-
-			if (!rd(mode + off_mode_vrefresh, &vr, sizeof(vr)) &&
-			    vr == expect_fps) {
-				save16(mode + off_mode_vrefresh, vr);
-				wr(mode + off_mode_vrefresh, &wv, sizeof(wv));
-				say("  vrefresh %u -> %u", vr, wv);
-			}
-		}
 	}
+	ret = save_original(m);
+	if (ret)
+		return ret;
 
-	if (off_adfr_hi) {
-		u32 v = rd_u32(panel + off_adfr_hi, NULL);
-
-		if (v == expect_fps) {
-			save32(panel + off_adfr_hi, v);
-			wr(panel + off_adfr_hi, &want_fps, sizeof(want_fps));
-			say("adfr 高刷表首元素 120 -> %u", want_fps);
-		}
-	}
-	if (off_adfr_min) {
-		u32 v = rd_u32(panel + off_adfr_min, NULL);
-
-		if (v == expect_fps) {
-			save32(panel + off_adfr_min, v);
-			wr(panel + off_adfr_min, &want_fps, sizeof(want_fps));
-			say("adfr 下探表首元素 120 -> %u", want_fps);
-		}
-	}
-
-	installed = changed > 0;
-	if (installed)
-		say("已改 %d 条 mode；息屏再亮屏让它重新生效", changed);
+	say("写入 mode=%px：clk %u->%u，fps->%u", m, SAVE.clk, want_clk, want_fps);
+	w32(m + L.clk_off, want_clk);
+	if (L.fps_u16)
+		w16(m + L.fps_off, (u16)want_fps);
 	else
-		say("一条都没改到，检查偏移对不对");
-	return installed ? 0 : -ENOENT;
+		w32(m + L.fps_off, want_fps);
+	if (L.transfer_off != U32_MAX && SAVE.transfer == src_transfer)
+		w32(m + L.transfer_off, want_transfer);
+	if (L.khz_off != U32_MAX && SAVE.khz) {
+		khz_new = (u32)((u64)SAVE.khz * want_fps / 120);
+
+		say("  drm clock %u -> %u kHz", SAVE.khz, khz_new);
+		w32(m + L.khz_off, khz_new);
+	}
+	if (SAVE.have_adfr) {
+		bool ok;
+		unsigned long p = rptr(L.display + L.panel_off, &ok);
+
+		if (ok && kern(p)) {
+			say("  panel adfr 高刷表首元素 120 -> %u", want_fps);
+			w32(p + L.adfr_off, want_fps);
+		}
+	}
+	applied = true;
+	say("已应用。验收：切一次帧率，驱动日志必须出现 fps=144 且 clk_rate=%u", want_clk);
+	return 0;
 }
 
-static int do_rollback(void)
+static int do_restore(void)
 {
-	int i;
+	unsigned long m = target_mode();
 
-	for (i = n16 - 2; i >= 0; i -= 2) {
-		u16 v = (u16)saved16[i + 1];
+	if (!saved || !m)
+		return 0;
+	w32(m + L.clk_off, SAVE.clk);
+	if (L.fps_u16)
+		w16(m + L.fps_off, SAVE.fps16);
+	else
+		w32(m + L.fps_off, SAVE.fps32);
+	if (L.transfer_off != U32_MAX && SAVE.transfer)
+		w32(m + L.transfer_off, SAVE.transfer);
+	if (L.khz_off != U32_MAX && SAVE.khz)
+		w32(m + L.khz_off, SAVE.khz);
+	if (SAVE.have_adfr) {
+		bool ok;
+		unsigned long p = rptr(L.display + L.panel_off, &ok);
 
-		if (wr((unsigned long)saved16[i], &v, sizeof(v)))
-			say("回滚 16 位 0x%llx 失败", saved16[i]);
+		if (ok && kern(p))
+			w32(p + L.adfr_off, SAVE.adfr);
 	}
-	for (i = n32 - 2; i >= 0; i -= 2) {
-		u32 v = (u32)saved32[i + 1];
-
-		if (wr((unsigned long)saved32[i], &v, sizeof(v)))
-			say("回滚 0x%llx 失败", saved32[i]);
-	}
-	say("已回滚 32 位 %d 处 + 16 位 %d 处", n32 / 2, n16 / 2);
-	n32 = n16 = 0;
-	installed = false;
+	applied = false;
+	say("已还原 mode 的 120 档原值；重启一次最彻底");
 	return 0;
 }
 
@@ -409,7 +535,7 @@ static ssize_t report_get(char *buf, const struct kernel_param *kp)
 	size_t n = READ_ONCE(report_len);
 
 	if (n > 4000)
-		n = 4000;	/* param->get 只有一页，4000 留余量 */
+		n = 4000;
 	memcpy(buf, report, n);
 	return n;
 }
@@ -417,8 +543,12 @@ static ssize_t report_get(char *buf, const struct kernel_param *kp)
 static ssize_t state_get(char *buf, const struct kernel_param *kp)
 {
 	return scnprintf(buf, 4000,
-			 "display=%px validated=%d installed=%d saved32=%d saved16=%d want_pclk=%u want_fps=%u\n",
-			 display, validated, installed, n32 / 2, n16 / 2, want_pclk, want_fps);
+		"display=0x%lx layout=%d applied=%d probe_only=%d fail=%u slot=%d count=%u "
+		"modes_off=0x%x arr=0x%lx clk_off=0x%x fps_off=0x%x(%s) transfer_off=0x%x "
+		"khz_off=0x%x panel_off=0x%x adfr_off=0x%x adfr_calls=%d\n",
+		L.display, layout_ok, applied, probe_only, failure_code, L.slot, L.count,
+		L.modes_off, L.modes_arr, L.clk_off, L.fps_off, L.fps_u16 ? "u16" : "u32",
+		L.transfer_off, L.khz_off, L.panel_off, L.adfr_off, adfr_calls);
 }
 
 static int state_set(const char *val, const struct kernel_param *kp)
@@ -432,68 +562,93 @@ static int state_set(const char *val, const struct kernel_param *kp)
 	return 0;
 }
 
-static int install_set(const char *val, const struct kernel_param *kp)
+static int apply_set(const char *val, const struct kernel_param *kp)
 {
 	bool on = (*val == '1' || *val == 'y' || *val == 'Y');
 
-	return on ? do_install() : do_rollback();
+	return on ? do_apply() : do_restore();
 }
 
-static ssize_t install_get(char *buf, const struct kernel_param *kp)
+static ssize_t apply_get(char *buf, const struct kernel_param *kp)
 {
-	return scnprintf(buf, 4000, "%d\n", installed ? 1 : 0);
+	return scnprintf(buf, 4000, "%d\n", applied ? 1 : 0);
+}
+
+static int rescan_set(const char *val, const struct kernel_param *kp)
+{
+	u32 count = L.count ? L.count : 4;
+
+	if (!L.display)
+		return -ENOENT;
+	layout_ok = false;
+	if (discover_layout(L.display, count)) {
+		discover_panel(L.display);
+		layout_ok = true;
+		return 0;
+	}
+	return -EIO;
 }
 
 static const struct kernel_param_ops report_ops = { .get = report_get };
 static const struct kernel_param_ops state_ops = { .get = state_get, .set = state_set };
-static const struct kernel_param_ops install_ops = { .get = install_get, .set = install_set };
+static const struct kernel_param_ops apply_ops = { .get = apply_get, .set = apply_set };
+static const struct kernel_param_ops rescan_ops = { .set = rescan_set };
 
 module_param_cb(report, &report_ops, NULL, 0444);
 module_param_cb(state, &state_ops, NULL, 0644);
-module_param_cb(install, &install_ops, NULL, 0644);
-MODULE_PARM_DESC(report, "验证与改写过程（读这里，不要只靠 dmesg）");
-MODULE_PARM_DESC(state, "读状态；写任意值清空 report");
-MODULE_PARM_DESC(install, "写 1 注入 144，写 0 回滚原厂值");
+module_param_cb(apply, &apply_ops, NULL, 0644);
+module_param_cb(rescan, &rescan_ops, NULL, 0200);
+MODULE_PARM_DESC(report, "发现与改写过程（读这个，别只靠 dmesg）");
+MODULE_PARM_DESC(state, "当前布局与状态；写任意值清空 report");
+MODULE_PARM_DESC(apply, "1=把选中的 120 档改写成 144；0=还原");
+MODULE_PARM_DESC(rescan, "写任意值重新发现布局");
 
-module_param(off_panel, ullong, 0444);
-module_param(off_num_modes, ullong, 0444);
-module_param(off_modes, ullong, 0444);
-module_param(off_mode_pclk, ullong, 0444);
-module_param(off_mode_transfer, ullong, 0444);
-module_param(off_mode_vrefresh, ullong, 0444);
-module_param(off_mode_clock, ullong, 0444);
-module_param(off_adfr_hi, ullong, 0444);
-module_param(off_adfr_min, ullong, 0444);
-module_param(want_pclk, uint, 0644);
-module_param(want_transfer, uint, 0644);
+module_param(probe_only, bool, 0644);
+module_param(want_clk, uint, 0644);
 module_param(want_fps, uint, 0644);
-MODULE_PARM_DESC(off_panel, "dsi_display -> dsi_panel * 偏移");
-MODULE_PARM_DESC(off_num_modes, "dsi_display -> modes_count 偏移");
-MODULE_PARM_DESC(off_modes, "dsi_display -> dsi_display_mode **modes 偏移");
-MODULE_PARM_DESC(off_mode_pclk, "dsi_display_mode -> pclk 偏移");
+module_param(want_transfer, uint, 0644);
+module_param(want_slot, int, 0644);
+module_param(src_clk, uint, 0444);
+module_param_string(panel_node, panel_node, sizeof(panel_node), 0444);
+MODULE_PARM_DESC(probe_only, "1=只发现不改内存（默认）");
+MODULE_PARM_DESC(want_clk, "144 档 DSI 时钟，默认 1239700000");
+MODULE_PARM_DESC(want_slot, "改第几条 mode；-1 表示自动取最后一条 120");
+MODULE_PARM_DESC(panel_node, "面板设备树节点名");
 
 static int __init ace5_144_init(void)
 {
-	int ret = register_kprobe(&kp);
+	int ret;
 
+	L.slot = -1;
+	L.transfer_off = U32_MAX;
+	L.khz_off = U32_MAX;
+	L.adfr_off = U32_MAX;
+
+	ret = register_kprobe(&kp_disp);
 	if (ret) {
 		say("注册 dsi_display_prepare 失败 ret=%d", ret);
+		failure_code = 10;
 		return ret;
 	}
-	say("loaded；抓到 display 后 echo 1 > parameters/install，撤销写 0");
+	ret = register_kprobe(&kp_adfr);
+	if (ret)
+		say("oplus_adfr_property_update 未挂上 ret=%d（不影响改 mode）", ret);
+	say("loaded：等一次显示操作触发布局发现，然后读 parameters/state");
 	return 0;
 }
 
 static void __exit ace5_144_exit(void)
 {
-	if (installed)
-		do_rollback();
-	unregister_kprobe(&kp);
+	if (applied)
+		do_restore();
+	unregister_kprobe(&kp_disp);
+	if (kp_adfr.addr)
+		unregister_kprobe(&kp_adfr);
 	pr_info(TAG ": unloaded\n");
 }
 
 module_init(ace5_144_init);
 module_exit(ace5_144_exit);
-MODULE_DESCRIPTION("OnePlus Ace5 runtime 144Hz injector, offsets via module params");
+MODULE_DESCRIPTION("OnePlus Ace5 runtime 144Hz; layout discovered, no dtbo change");
 MODULE_AUTHOR("XiYan");
 MODULE_LICENSE("GPL");

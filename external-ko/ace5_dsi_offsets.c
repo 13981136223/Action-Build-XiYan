@@ -37,6 +37,8 @@ static void *captured;
 static const char *captured_from;
 static int identified;
 static int fired;			/* 探针被调用过几次（不管有没有认出来） */
+static const char *seen_from[8];
+static int nseen;
 
 /* 结果同时进 dmesg 和 report，避免日志被冲掉后什么都拿不到 */
 __printf(1, 2)
@@ -206,6 +208,19 @@ static int try_capture(struct pt_regs *regs, const char *from)
 	if (READ_ONCE(identified))
 		return 0;
 	WRITE_ONCE(fired, READ_ONCE(fired) + 1);
+	/* 记录到底是哪个函数被调到：这决定注入器该挂哪里 */
+	{
+		int i;
+		bool known = false;
+
+		for (i = 0; i < nseen; i++)
+			if (seen_from[i] == from)
+				known = true;
+		if (!known && nseen < (int)ARRAY_SIZE(seen_from)) {
+			seen_from[nseen++] = from;
+			say("首次命中探针 %s（arg0=0x%lx）", from, regs->regs[0]);
+		}
+	}
 
 	if (!kern_addr(cand) || !identify(cand))
 		return 0;

@@ -2623,10 +2623,10 @@ jobs:
 
           # 仓库根在构建机上会被挂载盖掉，按本次 commit 从 raw 取源码（与 CRC 那一步同一个坑）
           SRC=$(mktemp -d)
-          MODULES="ace5_dsi_probe ace5_dsi_offsets"
+          MODULES="ace5_dsi_probe ace5_dsi_offsets ace5_dsi_144"
           RAW="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/external-ko"
           curl -fsSL "$RAW/Makefile" -o "$SRC/Makefile" || { echo "::error::下载 Makefile 失败"; exit 1; }
-          grep -q 'obj-m += ace5_dsi_probe.o ace5_dsi_offsets.o' "$SRC/Makefile" || { echo "::error::取回的 Makefile 不含两个模块"; exit 1; }
+          grep -q 'obj-m += ace5_dsi_probe.o ace5_dsi_offsets.o ace5_dsi_144.o' "$SRC/Makefile" || { echo "::error::取回的 Makefile 不含三个模块"; exit 1; }
           for m in $MODULES; do
             curl -fsSL "$RAW/$m.c" -o "$SRC/$m.c" || { echo "::error::下载源码失败 $RAW/$m.c"; exit 1; }
             echo "源码就位: $m.c ($(wc -c < "$SRC/$m.c") 字节)"

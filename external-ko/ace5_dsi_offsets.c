@@ -218,7 +218,7 @@ static int try_capture(struct pt_regs *regs, const char *from)
 				known = true;
 		if (!known && nseen < (int)ARRAY_SIZE(seen_from)) {
 			seen_from[nseen++] = from;
-			say("首次命中探针 %s（arg0=0x%lx）", from, regs->regs[0]);
+			say("首次命中探针 %s（arg0=0x%llx）", from, (u64)regs->regs[0]);
 		}
 	}
 
@@ -251,17 +251,17 @@ static struct kprobe probes[] = {
 	{ .symbol_name = "dsi_display_commit",       .pre_handler = hp_commit },
 };
 
-static ssize_t report_show(char *buf, const struct kernel_param *kp)
+static int report_show(char *buf, const struct kernel_param *kp)
 {
 	size_t n = READ_ONCE(report_len);
 
 	if (n > 4000)
 		n = 4000;	/* param->get 只有一页，4000 留余量 */
 	memcpy(buf, report, n);
-	return n;
+	return (int)n;
 }
 
-static ssize_t state_show(char *buf, const struct kernel_param *kp)
+static int state_show(char *buf, const struct kernel_param *kp)
 {
 	return scnprintf(buf, 4000, "identified=%d fired=%d captured=%px from=%s report_len=%zu\n",
 			 identified, fired, captured, captured_from ?: "-", READ_ONCE(report_len));

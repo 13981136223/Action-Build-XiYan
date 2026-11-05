@@ -2578,6 +2578,76 @@ jobs:
           name: AnyKernel3_SukiSUUltra_${{ env.KSUVER }}_${{ steps.extract_info.outputs.value }}(${{ env.CKERNEL_VERSION }})${{ steps.suffix.outputs.value }}
           path: ./AnyKernel3/*
 
+      - name: Build ACE5 DSI probe ko
+        if: always()
+        run: |
+          # 一加 Ace 5 显示 144 项目·迭代1：只读探针 ko。
+          # 必须在刚编好的 GKI out 树里用 kbuild 编，vermagic / __versions CRC / KCFI
+          # 才由内核自己的 modpost 生成；裸 clang 编出来的东西装不上。
+          cd "$GITHUB_WORKSPACE"
+
+          COMMON=kernel_workspace/kernel_platform/common
+          OUT=$(find "$COMMON" -maxdepth 2 -type d -name out 2>/dev/null | head -1)
+          [ -n "$OUT" ] || { echo "::error::找不到 common/out，这轮没有可用内核树"; exit 1; }
+          SYMVERS="$OUT/Module.symvers"
+          [ -s "$SYMVERS" ] || { echo "::error::缺 $SYMVERS（没有它就没有 CRC，编出来的 ko 必装不上）"; exit 1; }
+          echo "内核树=$OUT  Module.symvers 行数=$(wc -l < "$SYMVERS")"
+
+          CLANG=$(find kernel_workspace/kernel_platform -maxdepth 6 -type f -path '*/bin/clang' 2>/dev/null | head -1)
+          [ -n "$CLANG" ] || { echo "::error::没找到 prebuilts clang"; exit 1; }
+          BIN=$(dirname "$CLANG")
+          export PATH="$BIN:$PATH"
+          echo "clang=$("$CLANG" --version | head -1)"
+
+          # 仓库根在构建机上会被挂载盖掉，按本次 commit 从 raw 取源码（与 CRC 那一步同一个坑）
+          SRC=$(mktemp -d)
+          RAW="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/external-ko"
+          curl -fsSL "$RAW/ace5_dsi_probe.c" -o "$SRC/ace5_dsi_probe.c" || { echo "::error::下载源码失败 $RAW"; exit 1; }
+          curl -fsSL "$RAW/Makefile"        -o "$SRC/Makefile" || { echo "::error::下载 Makefile 失败"; exit 1; }
+          grep -q 'obj-m += ace5_dsi_probe.o' "$SRC/Makefile" || { echo "::error::取回的 Makefile 内容不对"; exit 1; }
+          echo "模块源码就位: $SRC ($(wc -c < "$SRC/ace5_dsi_probe.c") 字节)"
+
+          make -C "$COMMON" O="$OUT" \
+               ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
+               CC=clang LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy STRIP=llvm-strip \
+               PAHOLE=false HOSTCC=gcc \
+               M="$SRC" modules 2>&1 | tail -40
+          KO="$SRC/ace5_dsi_probe.ko"
+          [ -f "$KO" ] || { echo "::error::编译没产出 ace5_dsi_probe.ko（失败不算通过，不交绿灯）"; exit 1; }
+
+          echo "=== modinfo ==="
+          modinfo "$KO" 2>&1 | grep -E '^(vermagic|name|license|description|depends)' || true
+          echo "=== 静态核对 1：vermagic 的内核串必须等于目标机的 uname -r ==="
+          REL=$(cat "$OUT/include/config/kernel.release" 2>/dev/null || true)
+          VM=$(modinfo -F vermagic "$KO" 2>/dev/null || echo "")
+          echo "kernel.release=$REL"
+          echo "ko.vermagic=$VM"
+          case "$VM" in
+            *"$REL"*) echo "OK vermagic 前缀一致" ;;
+            *) echo "::error::vermagic 与 kernel.release 不一致"; exit 1 ;;
+          esac
+          echo "=== 静态核对 2：未定义符号必须都能在 Module.symvers 里查到 ==="
+          MISSING=0
+          for s in $("$BIN/llvm-nm" -u "$KO" | awk '{print $2}'); do
+            grep -Pq "\t$s\t" "$SYMVERS" || { echo "  缺 CRC: $s"; MISSING=1; }
+          done
+          [ "$MISSING" = 0 ] && echo "OK 所有未定义符号都有 CRC" || { echo "::error::有符号在 Module.symvers 里查不到"; exit 1; }
+          echo "=== 静态核对 3：KCFI / MODVERSIONS 与目标机一致（目标机实测 CFI_CLANG=y, CFI_PERMISSIVE 未开, MODVERSIONS=y）==="
+          grep -E 'CONFIG_(CFI_CLANG|CFI_PERMISSIVE|MODVERSIONS|KPROBES|MODULE_SIG_FORCE)(=| is)' "$OUT/.config" || true
+
+          mkdir -p "$GITHUB_WORKSPACE/ace5-ko"
+          cp "$KO" "$GITHUB_WORKSPACE/ace5-ko/ace5_dsi_probe.ko"
+          sha256sum "$GITHUB_WORKSPACE/ace5-ko/ace5_dsi_probe.ko" | tee "$GITHUB_WORKSPACE/ace5-ko/sha256.txt"
+          echo "产物就绪: ace5-ko/ace5_dsi_probe.ko"
+
+      - name: Upload ACE5 DSI probe ko
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ace5-dsi-probe-ko-${{ steps.extract_info.outputs.value }}
+          retention-days: 7
+          path: ./ace5-ko/*
+
       - name: Collect Oplus scheduler modules
         id: sched_mod
         run: |

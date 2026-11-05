@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * ace5_dsi_offsets.c — 迭代 2：只读偏移扫描器
+ * ace5_dsi_offsets.c — 迭代 2b：偏移扫描器（结果走 sysfs，不靠 dmesg）
  *
- * 厂商显示驱动没开源，struct dsi_display / dsi_display_mode 的字段偏移不能猜。
- * 这里挂一个 kprobe 抓真实对象，再用"已知真值"当指纹反推偏移：
- *   - 面板名串 qcom,mdss_dsi_panel_AA577_P_3_A0020_dsc_cmd（指针指向 或 内联在对象里）
- *   - 官方 timing 档数 4（迭代 1 在运行时设备树里数出来）
- *   - DSI 时钟 1,012,000,000（迭代 1 读到的 panel-clockrate）
- * 命中才打印，不命中一条不报；全程只读，不写任何内存。
+ * 上一版两个问题：
+ *   1) 只挂 dsi_display_set_mode，息屏/亮屏/改帧率都没让它命中；
+ *   2) 输出全靠 pr_info，这台机器 KernelSU 日志刷得飞快，两分钟就冲干净。
+ * 现在：多挂几个必然被调的入口，结果同时写进
+ *   /sys/module/ace5_dsi_offsets/parameters/report 与 dmesg。
+ * 仍然全程只读（copy_from_kernel_nofault），不写任何内存。
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/stdarg.h>
 #include <linux/kprobes.h>
 #include <linux/uaccess.h>
 #include <linux/string.h>
@@ -19,19 +20,51 @@
 #include <linux/spinlock.h>
 
 #define TAG "ace5off"
-#define WIN 2048			/* 一次扫描的窗口；结构体不会比这大 */
-#define SUBWIN 256			/* 指针指向的子对象再挖一层的窗口 */
+#define WIN 2048
+#define SUBWIN 256
+#define REPORT_CAP 3000		/* module_param get 只能给一页，留足余量 */
 
-static const char panel_key[] = "qcom,mdss_dsi_panel_AA577_P_3_A0020_dsc_cmd";
-static const u32 expect_pclk = 1012000000;	/* 0x3c51e500，运行时设备树实测 */
+static const char panel_prefix[] = "qcom,mdss_dsi_panel";
+static const u32 expect_pclk = 1012000000;	/* 0x3c51e500 */
 static const u32 expect_mode_cnt = 4;
+static const u32 expect_fps = 120;
 
-static void *captured;			/* 已抓到并确认身份的 display 对象 */
-static DEFINE_SPINLOCK(capture_lock);
+static char report[REPORT_CAP];
+static size_t report_len;
+static DEFINE_SPINLOCK(report_lock);
+
+static void *captured;
+static const char *captured_from;
+static int identified;
+static int fired;			/* 探针被调用过几次（不管有没有认出来） */
+
+/* 结果同时进 dmesg 和 report，避免日志被冲掉后什么都拿不到 */
+__printf(1, 2)
+static void say(const char *fmt, ...)
+{
+	char line[160];
+	va_list ap;
+	unsigned long flags;
+	int n;
+
+	va_start(ap, fmt);
+	n = vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		return;
+	pr_info(TAG ": %s\n", line);
+
+	spin_lock_irqsave(&report_lock, flags);
+	if (report_len + n + 1 < REPORT_CAP) {
+		memcpy(report + report_len, line, n);
+		report_len += n;
+		report[report_len++] = '\n';
+	}
+	spin_unlock_irqrestore(&report_lock, flags);
+}
 
 static bool kern_addr(unsigned long a)
 {
-	/* arm64 内核 VA 高地址；同时排除 ERR_PTR 区间 */
 	return (long)a < 0 && !IS_ERR((void *)a);
 }
 
@@ -42,18 +75,19 @@ static int rd(unsigned long addr, void *buf, size_t len)
 	return copy_from_kernel_nofault(buf, (void *)addr, len);
 }
 
-/* 该地址是否指向面板名串 */
-static bool ptr_is_panel_name(unsigned long a)
+static bool str_at(unsigned long a, const char *key)
 {
 	char probe[80];
+	size_t klen = strlen(key);
 
+	if (klen >= sizeof(probe))
+		return false;
 	if (rd(a, probe, sizeof(probe)))
 		return false;
 	probe[sizeof(probe) - 1] = '\0';
-	return !strncmp(probe, panel_key, sizeof(panel_key) - 1);
+	return !strncmp(probe, key, klen);
 }
 
-/* 该地址是否指向一段可打印串（找 name/label 之类字段） */
 static bool ptr_is_string(unsigned long a, char *out, size_t outlen)
 {
 	char probe[48];
@@ -74,151 +108,202 @@ static bool ptr_is_string(unsigned long a, char *out, size_t outlen)
 	return true;
 }
 
-/* 对象里内联存放的面板名（dsi_panel->name 常是 char[] 而非指针） */
-static bool inline_is_panel_name(unsigned long base, int off)
-{
-	char probe[80];
-
-	if (rd(base + off, probe, sizeof(probe)))
-		return false;
-	probe[sizeof(probe) - 1] = '\0';
-	return !strncmp(probe, panel_key, sizeof(panel_key) - 1);
-}
-
-static void scan_object(unsigned long base)
+/* 对象窗口里能不能找到面板名。三种存法都要覆盖：
+ *   a) 窗口里内联着名字；
+ *   b) 窗口里的指针直接指向名字（dsi_panel->name 若在第 0 偏移）；
+ *   c) 窗口里的指针指向一个对象，名字在该对象前 512 字节内（name 不在第 0 偏移）。
+ * 上一版只做了 a/b，所以息屏亮屏跑了也没认出来。 */
+static bool name_inside(unsigned long a, int win)
 {
 	int off;
-	char txt[96];
 
-	pr_info(TAG ": 扫描对象 0x%lx，窗口 %d\n", base, WIN);
+	for (off = 0; off + 8 <= win; off += 8)
+		if (str_at(a + off, panel_prefix))
+			return true;
+	return false;
+}
+
+static bool identify(unsigned long base)
+{
+	int off, ptrs = 0;
 
 	for (off = 0; off + 8 <= WIN; off += 8) {
 		unsigned long val;
-		u32 lo, hi;
 
-		/* 内联串 */
-		if (inline_is_panel_name(base, off))
-			pr_info(TAG ": +0x%03x 内联面板名（dsi_panel->name 候选，注意 8 对齐）\n", off);
-
+		if (str_at(base + off, panel_prefix))
+			return true;
 		if (rd(base + off, &val, sizeof(val)))
 			continue;
-
-		if (kern_addr(val) && ptr_is_panel_name(val))
-			pr_info(TAG ": +0x%03x ptr -> 面板名（panel/dsi 指针候选）\n", off);
-
-		lo = (u32)val;
-		hi = (u32)(val >> 32);
-		if (lo == expect_mode_cnt || hi == expect_mode_cnt)
-			pr_info(TAG ": +0x%03x 含 u32=4（%s，modes/timings 计数候选）\n",
-				off, lo == expect_mode_cnt ? "低半" : "高半");
-		if (lo == expect_pclk || hi == expect_pclk)
-			pr_info(TAG ": +0x%03x 含 u32=1012000000（%s，DSI 时钟候选）\n",
-				off, lo == expect_pclk ? "低半" : "高半");
-
 		if (!kern_addr(val))
 			continue;
-
-		/* 指不到面板名时，退一步看看是不是别的可读串 */
-		if (!ptr_is_panel_name(val)) {
-			if (ptr_is_string(val, txt, sizeof(txt)))
-				pr_info(TAG ": +0x%03x ptr -> 串 \"%s\"\n", off, txt);
-		}
-
-		/* 子对象里再找 pclk：mode->timing_info.pclk 这类 */
-		{
-			int so;
-
-			for (so = 0; so + 4 <= SUBWIN; so += 4) {
-				u32 sub;
-
-				if (rd(val + so, &sub, sizeof(sub)))
-					break;
-				if (sub == expect_pclk)
-					pr_info(TAG ": +0x%03x ptr -> 子对象+0x%03x = 1012000000（pclk）\n",
-						off, so);
-			}
-		}
-	}
-	pr_info(TAG ": 扫描结束\n");
-}
-
-/* arg0 是不是我们要的那个对象：窗口内必须能找到面板名 */
-static bool identify(unsigned long cand)
-{
-	int off;
-	char probe[80];
-
-	for (off = 0; off + 8 <= WIN; off += 8) {
-		unsigned long val;
-
-		if (!rd(cand + off, probe, sizeof(probe)) &&
-		    !strncmp(probe, panel_key, sizeof(panel_key) - 1))
+		if (str_at(val, panel_prefix))
 			return true;
-		if (!rd(cand + off, &val, sizeof(val)) &&
-		    kern_addr(val) && !rd(val, probe, 24) &&
-		    !strncmp(probe, panel_key, sizeof(panel_key) - 1))
+		if (++ptrs <= 96 && name_inside(val, SUBWIN))
 			return true;
 	}
 	return false;
 }
 
-static int set_mode_entry(struct kprobe *p, struct pt_regs *regs)
+static void scan_object(unsigned long base, const char *from)
+{
+	int off;
+	char txt[96];
+
+	say("对象 0x%lx 来自 %s，扫描 %d 字节", base, from, WIN);
+
+	for (off = 0; off + 8 <= WIN; off += 8) {
+		unsigned long val;
+		u32 lo, hi;
+
+		if (str_at(base + off, panel_prefix))
+			say("+0x%03x 内联面板名", off);
+
+		if (rd(base + off, &val, sizeof(val)))
+			continue;
+
+		if (kern_addr(val) && str_at(val, panel_prefix))
+			say("+0x%03x ptr->面板名", off);
+
+		lo = (u32)val;
+		hi = (u32)(val >> 32);
+		if (lo == expect_mode_cnt || hi == expect_mode_cnt)
+			say("+0x%03x u32=4（%s）计数候选", off, lo == expect_mode_cnt ? "低半" : "高半");
+		if (lo == expect_pclk || hi == expect_pclk)
+			say("+0x%03x u32=1012000000（%s）时钟候选", off,
+			    lo == expect_pclk ? "低半" : "高半");
+		if (lo == expect_fps || hi == expect_fps)
+			say("+0x%03x u32=120（%s）帧率候选", off, lo == expect_fps ? "低半" : "高半");
+
+		if (!kern_addr(val))
+			continue;
+
+		if (!str_at(val, panel_prefix) && ptr_is_string(val, txt, sizeof(txt)))
+			say("+0x%03x ptr->\"%s\"", off, txt);
+
+		{
+			int so;
+			u32 sub;
+
+			for (so = 0; so + 4 <= SUBWIN; so += 4) {
+				if (rd(val + so, &sub, sizeof(sub)))
+					break;
+				if (sub == expect_pclk)
+					say("+0x%03x ptr->子+0x%03x=1012000000", off, so);
+				if (sub == expect_mode_cnt && so < 64)
+					say("+0x%03x ptr->子+0x%03x=4", off, so);
+			}
+		}
+	}
+	say("扫描结束");
+}
+
+static int try_capture(struct pt_regs *regs, const char *from)
 {
 	unsigned long cand = regs->regs[0];
 	unsigned long flags;
-	bool have;
+	bool fresh = false;
 
-	spin_lock_irqsave(&capture_lock, flags);
-	have = captured != NULL;
-	spin_unlock_irqrestore(&capture_lock, flags);
-	if (have)
-		return 0;			/* 已抓够，正常放行被探指令 */
+	if (READ_ONCE(identified))
+		return 0;
+	WRITE_ONCE(fired, READ_ONCE(fired) + 1);
 
 	if (!kern_addr(cand) || !identify(cand))
 		return 0;
 
-	spin_lock_irqsave(&capture_lock, flags);
-	if (!captured)
+	spin_lock_irqsave(&report_lock, flags);
+	if (!identified) {
+		identified = 1;
 		captured = (void *)cand;
-	have = true;
-	spin_unlock_irqrestore(&capture_lock, flags);
-	if (!have)
-		return 0;
+		captured_from = from;
+		fresh = true;
+	}
+	spin_unlock_irqrestore(&report_lock, flags);
 
-	pr_info(TAG ": 确认 display 对象 0x%lx（dsi_display_set_mode arg0）\n", cand);
-	/*
-	 * 这里在被探函数上下文里做一次扫描，只跑一次；窗口已压到 2048，
-	 * 且 identify() 已确认可读，避免对野指针做无谓解引用。
-	 */
-	scan_object(cand);
-	return 0;				/* 返回 0：不跳过被探指令，行为不变 */
+	if (fresh)
+		scan_object(cand, from);
+	return 0;				/* 返回 0：不跳过被探指令 */
 }
 
-static struct kprobe kp_setmode = {
-	.symbol_name = "dsi_display_set_mode",
-	.pre_handler = set_mode_entry,
+static int hp_set_mode(struct kprobe *p, struct pt_regs *r) { return try_capture(r, "dsi_display_set_mode"); }
+static int hp_prepare(struct kprobe *p, struct pt_regs *r) { return try_capture(r, "dsi_display_prepare"); }
+static int hp_validate(struct kprobe *p, struct pt_regs *r) { return try_capture(r, "dsi_display_validate_mode"); }
+static int hp_commit(struct kprobe *p, struct pt_regs *r) { return try_capture(r, "dsi_display_commit"); }
+
+static struct kprobe probes[] = {
+	{ .symbol_name = "dsi_display_set_mode",     .pre_handler = hp_set_mode },
+	{ .symbol_name = "dsi_display_prepare",      .pre_handler = hp_prepare },
+	{ .symbol_name = "dsi_display_validate_mode", .pre_handler = hp_validate },
+	{ .symbol_name = "dsi_display_commit",       .pre_handler = hp_commit },
 };
+
+static ssize_t report_show(char *buf, const struct kernel_param *kp)
+{
+	size_t n = READ_ONCE(report_len);
+
+	if (n > PAGE_SIZE - 1)
+		n = PAGE_SIZE - 1;
+	memcpy(buf, report, n);
+	return n;
+}
+
+static ssize_t state_show(char *buf, const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "identified=%d fired=%d captured=%px from=%s report_len=%zu\n",
+			 identified, fired, captured, captured_from ?: "-", READ_ONCE(report_len));
+}
+
+static int state_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&report_lock, flags);
+	report_len = 0;
+	report[0] = '\0';
+	spin_unlock_irqrestore(&report_lock, flags);
+	pr_info(TAG ": report 已清空\n");
+	return 0;
+}
+
+static const struct kernel_param_ops report_ops = { .get = report_show };
+static const struct kernel_param_ops state_ops = { .get = state_show, .set = state_set };
+
+module_param_cb(report, &report_ops, NULL, 0444);
+MODULE_PARM_DESC(report, "扫描结果（读这里，不要靠 dmesg）");
+module_param_cb(state, &state_ops, NULL, 0644);
+MODULE_PARM_DESC(state, "写任意值清空 report；读看命中状态");
 
 static int __init ace5_off_init(void)
 {
-	int ret = register_kprobe(&kp_setmode);
+	int i, registered = 0, ret;
 
-	if (ret) {
-		pr_warn(TAG ": 注册 dsi_display_set_mode kprobe 失败 ret=%d\n", ret);
-		return ret;
+	say("loaded，探针注册情况如下");
+	for (i = 0; i < ARRAY_SIZE(probes); i++) {
+		ret = register_kprobe(&probes[i]);
+		say("注册 %s -> ret=%d", probes[i].symbol_name, ret);
+		if (!ret)
+			registered++;
 	}
-	pr_info(TAG ": 已挂探针，等一次模式切换（息屏再亮屏即可）\n");
+	if (!registered) {
+		say("一个探针都没挂上，卸载");
+		return -ENOENT;
+	}
+	say("就绪，等一次显示操作（息屏亮屏或改帧率）");
 	return 0;
 }
 
 static void __exit ace5_off_exit(void)
 {
-	unregister_kprobe(&kp_setmode);
-	pr_info(TAG ": unloaded，captured=%px\n", captured);
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(probes); i++) {
+		if (probes[i].addr)
+			unregister_kprobe(&probes[i]);
+	}
+	pr_info(TAG ": unloaded identified=%d fired=%d\n", identified, fired);
 }
 
 module_init(ace5_off_init);
 module_exit(ace5_off_exit);
-MODULE_DESCRIPTION("OnePlus Ace5 dsi_display offset scanner (read-only, iteration 2)");
+MODULE_DESCRIPTION("OnePlus Ace5 dsi_display offset scanner (report via sysfs, iteration 2b)");
 MODULE_AUTHOR("XiYan");
 MODULE_LICENSE("GPL");

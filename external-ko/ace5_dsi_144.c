@@ -77,6 +77,8 @@ static struct {
 	u32 count;
 	u32 stride;
 	u32 contig;
+	u32 derived[4];	/* 随帧率等比的派生时钟字段 */
+	u32 derived_n;
 	int slot;
 } L;
 
@@ -85,6 +87,8 @@ static struct {
 	u32 clk;
 	u32 clk_vals[4];
 	u32 clk_n;
+	u32 derived_vals[4];
+	u32 derived_n;
 	u32 priv_clk;
 	u32 fps32;
 	u16 fps16;
@@ -345,6 +349,7 @@ static bool try_contig_at(unsigned long d, u32 slot, u32 count)
 		L.slot = want_slot >= 0 && want_slot < (int)count ? want_slot : last120;
 		L.transfer_off = find_u32(arr, src_transfer, stride);
 		L.khz_off = find_khz(arr);
+		find_derived_fields(count, stride, fps_off);
 		say("连续数组命中 display+0x%x -> 0x%lx stride=0x%x clk_off=0x%x fps_off=0x%x(%s) 120数=%d 槽=%d",
 		    slot, arr, stride, clk_off, fps_off, var_u16 ? "u16" : "u32", n120, L.slot);
 		return true;
@@ -359,6 +364,46 @@ static unsigned long mode_at(u32 i)
 	if (L.contig)
 		return L.modes_arr + (unsigned long)i * L.stride;
 	return rptr(L.modes_arr + i * 8, &ok);
+}
+
+/* 识别"随帧率等比变化"的字段：对四条 mode 满足 v_i*fps_0 == v_0*fps_i。
+ * 真机实测 +0x38 (852681600) 就是这种：60/90/120 严格按比例。
+ * 上次崩机就是因为只改了帧率与 DSI 时钟，把这些派生时钟留在 120 档。 */
+static void find_derived_fields(u32 count, u32 stride, u32 fps_off)
+{
+	u32 off, i, v0;
+	u16 f0 = 0, fi;
+
+	L.derived_n = 0;
+	if (!count || rd(L.modes_arr + fps_off, &f0, sizeof(f0)) || !f0)
+		return;
+	for (off = 0; off + 4 <= stride && L.derived_n < 4; off += 4) {
+		bool ok;
+		bool good = true;
+
+		if (off == fps_off || off == L.clk_off)
+			continue;
+		v0 = r32(L.modes_arr + off, &ok);
+		if (!ok || !v0)
+			continue;
+		for (i = 1; i < count; i++) {
+			u32 vi = r32(L.modes_arr + i * stride + off, NULL);
+
+			fi = 0;
+			if (rd(L.modes_arr + i * stride + fps_off, &fi, sizeof(fi)) || !fi) {
+				good = false;
+				break;
+			}
+			if (!vi || (u64)v0 * fi != (u64)vi * f0) {
+				good = false;
+				break;
+			}
+		}
+		if (good) {
+			L.derived[L.derived_n++] = off;
+			say("派生时钟字段 +0x%x（值 %u，随帧率等比）", off, v0);
+		}
+	}
 }
 
 static bool try_modes_at(unsigned long d, u32 slot, u32 count)
@@ -684,6 +729,9 @@ static int save_original(unsigned long m)
 	SAVE.clk_n = L.clk_n;
 	for (i = 0; i < (int)L.clk_n && i < 4; i++)
 		SAVE.clk_vals[i] = r32(m + L.clk_offs[i], NULL);
+	SAVE.derived_n = L.derived_n;
+	for (i = 0; i < (int)L.derived_n && i < 4; i++)
+		SAVE.derived_vals[i] = r32(m + L.derived[i], NULL);
 	SAVE.priv_clk = 0;
 	if (L.priv_off) {
 		unsigned long sub = rptr(m + L.priv_off, &ok);
@@ -791,6 +839,17 @@ static int do_apply(void)
 			}
 		}
 	}
+	if (apply_step >= 3) {
+		for (i = 0; i < (int)L.derived_n && i < 4; i++) {
+			u32 ov = SAVE.derived_vals[i];
+			u32 nv = (u32)((u64)ov * want_fps / 120);
+
+			if (ov) {
+				say("  派生 +0x%x: %u -> %u", L.derived[i], ov, nv);
+				w32(m + L.derived[i], nv);
+			}
+		}
+	}
 	if (apply_step >= 2) {
 		/* 一律只写 2 字节：即便它其实是 u32（高半为 0），结果等价；
 		 * 而若它真是 u16，写 4 字节会踩坏后面那个字段。 */
@@ -842,6 +901,9 @@ static int do_restore(void)
 			w32(sub + L.priv_clk_off, SAVE.priv_clk);
 	}
 	w16(m + L.fps_off, SAVE.fps16);
+	for (i = 0; i < (int)SAVE.derived_n && i < 4; i++)
+		if (SAVE.derived_vals[i])
+			w32(m + L.derived[i], SAVE.derived_vals[i]);
 	if (L.transfer_off != U32_MAX && SAVE.transfer)
 		w32(m + L.transfer_off, SAVE.transfer);
 	if (L.khz_off != U32_MAX && SAVE.khz)

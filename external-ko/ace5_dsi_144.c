@@ -807,6 +807,34 @@ static void patch_one(unsigned long m, struct save_rec *sv)
 	}
 }
 
+/* 帧率字段必须在每条 mode 上都呈现档位值；只是某处恰好 120 不算证据。 */
+static bool fps_sequence_ok(void)
+{
+	u32 i, n120 = 0;
+
+	if (L.count < 2)
+		return false;
+	for (i = 0; i < L.count; i++) {
+		unsigned long m = mode_at(i);
+		u16 v = 0;
+
+		if (!kern(m) || rd(m + L.fps_off, &v, sizeof(v)))
+			return false;
+		if (v != 60 && v != 90 && v != 120) {
+			say("帧率校验失败：mode[%u] 读到 %u", i, v);
+			return false;
+		}
+		if (v == 120)
+			n120++;
+	}
+	if (n120 < 1) {
+		say("帧率校验失败：没有 120 档");
+		return false;
+	}
+	say("帧率序列校验通过（%u 条 120）", n120);
+	return true;
+}
+
 static int do_apply(void)
 {
 	struct save_rec *sv;
@@ -902,7 +930,6 @@ static int do_restore(void)
 		restore_one(&SAVED[k]);
 	unhook_adfr();
 	saved_n = 0;
-	saved = false;
 	applied = false;
 	say("已还原全部被改写的 120 档原值；重启一次最彻底");
 	return 0;

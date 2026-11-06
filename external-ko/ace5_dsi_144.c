@@ -74,6 +74,8 @@ static struct {
 	u32 panel_off;
 	u32 adfr_off;
 	u32 count;
+	u32 stride;
+	u32 contig;
 	int slot;
 } L;
 
@@ -253,6 +255,8 @@ static bool dt_confirm(u32 *count, u32 *n120)
 }
 
 /* 试把 dsi_display+slot 当成 modes 指针数组，逐项验证 */
+static unsigned long mode_at(u32 i);
+
 /* 某偏移是否在每条 mode 上都成立（用于剔除跨到相邻对象的偏移） */
 static bool off_holds_all(unsigned long arr, u32 count, u32 off, u32 want, u32 tol)
 {
@@ -260,7 +264,7 @@ static bool off_holds_all(unsigned long arr, u32 count, u32 off, u32 want, u32 t
 
 	for (i = 0; i < count; i++) {
 		bool ok;
-		unsigned long m = rptr(arr + i * 8, &ok);
+		unsigned long m = mode_at(i);
 		u32 v;
 
 		if (!ok || !kern(m))
@@ -276,6 +280,70 @@ static bool off_holds_all(unsigned long arr, u32 count, u32 off, u32 want, u32 t
 		}
 	}
 	return true;
+}
+
+/* 连续结构体数组：dsi_display_mode *modes（本条驱动就是这种）。
+ * 用"同一时钟在每个元素里重复出现"推 stride。 */
+static bool try_contig_at(unsigned long d, u32 slot, u32 count)
+{
+	bool ok;
+	unsigned long arr = rptr(d + slot, &ok);
+	u32 clk_off, fps_off = U32_MAX, stride, i;
+	int last120 = -1, n120 = 0;
+
+	if (!ok || !kern(arr))
+		return false;
+	clk_off = find_u32(arr, src_clk, 0x400);
+	if (clk_off == U32_MAX)
+		return false;
+
+	for (stride = 0x40; stride <= 0x800; stride += 8) {
+		if (!is32(arr + stride + clk_off, src_clk))
+			continue;
+		if (count > 2 && !is32(arr + 2 * stride + clk_off, src_clk))
+			continue;
+		if (count > 3 && !is32(arr + 3 * stride + clk_off, src_clk))
+			continue;
+
+		fps_off = find_u32(arr, 120, stride);
+		if (fps_off == U32_MAX || fps_off == clk_off)
+			continue;
+		n120 = 0; last120 = -1;
+		for (i = 0; i < count; i++) {
+			u32 f = r32(arr + i * stride + fps_off, NULL);
+
+			if (f == 120) { n120++; last120 = i; }
+			else if (f != 60 && f != 90)
+				break;
+		}
+		if (i < count || n120 < 2)
+			continue;
+
+		L.modes_off = slot;
+		L.modes_arr = arr;
+		L.stride = stride;
+		L.contig = 1;
+		L.clk_off = clk_off;
+		L.fps_off = fps_off;
+		L.fps_u16 = 0;
+		L.count = count;
+		L.slot = want_slot >= 0 && want_slot < (int)count ? want_slot : last120;
+		L.transfer_off = find_u32(arr, src_transfer, stride);
+		L.khz_off = find_khz(arr);
+		say("连续数组命中：display+0x%x -> 0x%lx stride=0x%x clk_off=0x%x fps_off=0x%x 120数=%d 槽=%d",
+		    slot, arr, stride, clk_off, fps_off, n120, L.slot);
+		return true;
+	}
+	return false;
+}
+
+static unsigned long mode_at(u32 i)
+{
+	bool ok;
+
+	if (L.contig)
+		return L.modes_arr + (unsigned long)i * L.stride;
+	return rptr(L.modes_arr + i * 8, &ok);
 }
 
 static bool try_modes_at(unsigned long d, u32 slot, u32 count)
@@ -337,6 +405,8 @@ static bool try_modes_at(unsigned long d, u32 slot, u32 count)
 
 	L.modes_off = slot;
 	L.modes_arr = arr;
+	L.contig = 0;
+	L.stride = 0;
 	L.clk_off = clk_off;
 	L.fps_off = fps_off;
 	L.fps_u16 = fps16;
@@ -390,7 +460,7 @@ static bool try_modes_at(unsigned long d, u32 slot, u32 count)
 			L.khz_off = U32_MAX;
 		}
 	}
-	say("modes 命中 display+0x%x -> 0x%lx 条数=%u clk_off=0x%x 副本=%u priv_off=0x%x priv_clk=0x%x fps_off=0x%x(%s) 120 数=%d 槽=%d",
+	say("指针数组命中 display+0x%x -> 0x%lx 条数=%u clk_off=0x%x 副本=%u priv_off=0x%x priv_clk=0x%x fps_off=0x%x(%s) 120数=%d 槽=%d",
 	    L.modes_off, L.modes_arr, L.count, L.clk_off, L.clk_n, L.priv_off, L.priv_clk_off,
 	    L.fps_off, L.fps_u16 ? "u16" : "u32", n120, L.slot);
 	if (L.transfer_off != U32_MAX)
@@ -407,7 +477,11 @@ static bool discover_layout(unsigned long d, u32 count)
 	for (slot = 0; slot + 8 <= OBJ_WIN; slot += 8)
 		if (try_modes_at(d, slot, count))
 			return true;
-	say("没能在 dsi_display 里定位 modes 数组（count=%u）", count);
+	/* 本条驱动是连续结构体数组，回退再试一遍 */
+	for (slot = 0; slot + 8 <= OBJ_WIN; slot += 8)
+		if (try_contig_at(d, slot, count))
+			return true;
+	say("没能在 dsi_display 里定位 modes（count=%u，两种布局都试过）", count);
 	failure_code = 1;
 	return false;
 }
@@ -570,12 +644,9 @@ static void unhook_adfr(void)
 
 static unsigned long target_mode(void)
 {
-	bool ok;
-	unsigned long m = rptr(L.modes_arr + L.slot * 8, &ok);
+	unsigned long m = mode_at(L.slot);
 
-	if (!ok || !kern(m))
-		return 0;
-	return m;
+	return kern(m) ? m : 0;
 }
 
 static int save_original(unsigned long m)
@@ -779,7 +850,7 @@ static int state_get(char *buf, const struct kernel_param *kp)
 		"khz_off=0x%x panel_off=0x%x adfr_off=0x%x clk_n=%u priv_off=0x%x priv_clk_off=0x%x adfr_calls=%d\n",
 		L.display, layout_ok, applied, probe_only, failure_code, L.slot, L.count,
 		L.modes_off, L.modes_arr, L.clk_off, L.fps_off, L.fps_u16 ? "u16" : "u32",
-		L.transfer_off, L.khz_off, L.panel_off, L.adfr_off, L.clk_n, L.priv_off, L.priv_clk_off, adfr_calls);
+		L.transfer_off, L.khz_off, L.panel_off, L.adfr_off, L.clk_n, L.priv_off, L.priv_clk_off, L.contig, L.stride, adfr_calls);
 }
 
 static int state_set(const char *val, const struct kernel_param *kp)

@@ -625,6 +625,11 @@ static struct kprobe kp_disp = {
 	.symbol_name = "dsi_display_prepare",
 	.pre_handler = capture_display,
 };
+/* 真机实测 validate_mode 最先被调到，作为第二个抓取入口 */
+static struct kprobe kp_val = {
+	.symbol_name = "dsi_display_validate_mode",
+	.pre_handler = capture_display,
+};
 static struct kprobe kp_adfr = {
 	.symbol_name = "oplus_adfr_property_update",
 	.pre_handler = watch_adfr,
@@ -946,6 +951,9 @@ static int __init ace5_144_init(void)
 		failure_code = 10;
 		return ret;
 	}
+	ret = register_kprobe(&kp_val);
+	if (ret)
+		say("注册 dsi_display_validate_mode 失败 ret=%d（有 prepare 兜底）", ret);
 	say("loaded：等一次显示操作（息屏亮屏）触发布局发现，然后读 parameters/state");
 	return 0;
 }
@@ -955,6 +963,8 @@ static void __exit ace5_144_exit(void)
 	if (applied)
 		do_restore();
 	unregister_kprobe(&kp_disp);
+	if (kp_val.addr)
+		unregister_kprobe(&kp_val);
 	unhook_adfr();
 	pr_info(TAG ": unloaded\n");
 }

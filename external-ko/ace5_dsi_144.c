@@ -521,32 +521,6 @@ static bool capture_at(unsigned long cand, const char *from)
 	return true;
 }
 
-/* 一加15 样本在 init 里直接调 get_main_display 拿主显，不等显示事件；
- * 那个符号在本机也存在但没导出，所以用 kprobe 取地址后立即撤销探针。 */
-static void *(*fn_get_main_display)(void);
-static struct kprobe kp_gmd = { .symbol_name = "get_main_display" };
-
-static void try_direct_capture(void)
-{
-	int ret;
-	void *d;
-
-	if (L.display || fn_get_main_display)
-		return;
-	ret = register_kprobe(&kp_gmd);
-	if (ret || !kp_gmd.addr) {
-		say("get_main_display 取不到地址（ret=%d），等显示事件再发现", ret);
-		return;
-	}
-	fn_get_main_display = (void *(*)(void))kp_gmd.addr;
-	unregister_kprobe(&kp_gmd);
-	d = fn_get_main_display();
-	if (d)
-		capture_at((unsigned long)d, "get_main_display");
-	else
-		say("get_main_display() 返回空");
-}
-
 static int capture_display(struct kprobe *p, struct pt_regs *regs)
 {
 	capture_at(regs->regs[0], "dsi_display_prepare");
@@ -887,10 +861,7 @@ static int __init ace5_144_init(void)
 		failure_code = 10;
 		return ret;
 	}
-	say("loaded：先试 get_main_display 直接发现，失败则等显示事件");
-	try_direct_capture();
-	if (!L.display)
-		say("仍未取得 display；息屏亮屏一次即可，然后读 parameters/state");
+	say("loaded：等一次显示操作（息屏亮屏）触发布局发现，然后读 parameters/state");
 	return 0;
 }
 

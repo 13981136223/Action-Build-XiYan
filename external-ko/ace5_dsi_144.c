@@ -261,6 +261,7 @@ static bool dt_confirm(u32 *count, u32 *n120)
 
 /* 试把 dsi_display+slot 当成 modes 指针数组，逐项验证 */
 static unsigned long mode_at(u32 i);
+static void find_derived_fields(u32 count, u32 stride, u32 fps_off);
 
 /* 某偏移是否在每条 mode 上都成立（用于剔除跨到相邻对象的偏移） */
 static bool off_holds_all(unsigned long arr, u32 count, u32 off, u32 want, u32 tol)

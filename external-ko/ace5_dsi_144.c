@@ -267,7 +267,7 @@ static bool off_holds_all(unsigned long arr, u32 count, u32 off, u32 want, u32 t
 		unsigned long m = mode_at(i);
 		u32 v;
 
-		if (!ok || !kern(m))
+		if (!kern(m))
 			return false;
 		v = r32(m + off, &ok);
 		if (!ok)

@@ -82,7 +82,8 @@ static struct {
 	int slot;
 } L;
 
-static struct {
+#define MAX_PATCH 4
+struct save_rec {
 	unsigned long mode;
 	u32 clk;
 	u32 clk_vals[4];
@@ -96,8 +97,9 @@ static struct {
 	u32 khz;
 	u32 adfr;
 	bool have_adfr;
-} SAVE;
-static bool saved;
+};
+static struct save_rec SAVED[MAX_PATCH];
+static u32 saved_n;
 static int adfr_calls;
 
 static char report[REPORT_CAP];
@@ -708,96 +710,109 @@ static void unhook_adfr(void)
 	say("ADFR 探针已撤，累计命中 %d 次", adfr_calls);
 }
 
-static unsigned long target_mode(void)
-{
-	unsigned long m = mode_at(L.slot);
 
-	return kern(m) ? m : 0;
-}
 
-static int save_original(unsigned long m)
+static int save_original(unsigned long m, struct save_rec *sv)
 {
 	bool ok;
 	int i;
 
-	SAVE.mode = m;
-	SAVE.clk = r32(m + L.clk_off, &ok);
-	if (!ok || SAVE.clk != src_clk) {
-		say("目标槽当前 clk=%u 不是 %u，拒绝写", SAVE.clk, src_clk);
-		failure_code = 6;
+	sv->mode = m;
+	sv->clk = r32(m + L.clk_off, &ok);
+	if (!ok || sv->clk != src_clk) {
+		say("槽 0x%lx 当前 clk=%u 不是 %u，跳过", m, sv->clk, src_clk);
 		return -EIO;
 	}
-	SAVE.clk_n = L.clk_n;
+	sv->clk_n = L.clk_n;
 	for (i = 0; i < (int)L.clk_n && i < 4; i++)
-		SAVE.clk_vals[i] = r32(m + L.clk_offs[i], NULL);
-	SAVE.derived_n = L.derived_n;
+		sv->clk_vals[i] = r32(m + L.clk_offs[i], NULL);
+	sv->derived_n = L.derived_n;
 	for (i = 0; i < (int)L.derived_n && i < 4; i++)
-		SAVE.derived_vals[i] = r32(m + L.derived[i], NULL);
-	SAVE.priv_clk = 0;
+		sv->derived_vals[i] = r32(m + L.derived[i], NULL);
+	sv->priv_clk = 0;
 	if (L.priv_off) {
 		unsigned long sub = rptr(m + L.priv_off, &ok);
 
 		if (ok && kern(sub))
-			SAVE.priv_clk = r32(sub + L.priv_clk_off, NULL);
+			sv->priv_clk = r32(sub + L.priv_clk_off, NULL);
 	}
 	{
 		u16 v = 0;
 
 		if (rd(m + L.fps_off, &v, sizeof(v)))
 			return -EIO;
-		SAVE.fps16 = v;
+		sv->fps16 = v;
 	}
-	if (L.transfer_off != U32_MAX)
-		SAVE.transfer = r32(m + L.transfer_off, NULL);
-	if (L.khz_off != U32_MAX)
-		SAVE.khz = r32(m + L.khz_off, NULL);
-	SAVE.have_adfr = false;
+	sv->transfer = (L.transfer_off != U32_MAX) ? r32(m + L.transfer_off, NULL) : 0;
+	sv->khz = (L.khz_off != U32_MAX) ? r32(m + L.khz_off, NULL) : 0;
+	sv->have_adfr = false;
 	if (L.panel_off && L.adfr_off != U32_MAX) {
 		unsigned long p = rptr(L.display + L.panel_off, &ok);
 
 		if (ok && kern(p)) {
-			SAVE.adfr = r32(p + L.adfr_off, NULL);
-			SAVE.have_adfr = (SAVE.adfr == src_adfr[0]);
+			sv->adfr = r32(p + L.adfr_off, NULL);
+			sv->have_adfr = (sv->adfr == src_adfr[0]);
 		}
 	}
-	saved = true;
 	return 0;
 }
 
-/* 帧率字段必须在四条 mode 上呈现 120/90/60/120 这种档位序列；
- * 只是"某个位置恰好等于 120"不算证据。上一版崩机就是缺这道闸。 */
-static bool fps_sequence_ok(void)
+static void patch_one(unsigned long m, struct save_rec *sv)
 {
-	u32 i, n120 = 0;
+	int i;
 
-	if (L.count < 2)
-		return false;
-	for (i = 0; i < L.count; i++) {
-		unsigned long m = mode_at(i);
-		u16 v = 0;
+	say("写入 mode=0x%lx（step=%u）：clk %u->%u fps->%u",
+	    m, apply_step, sv->clk, want_clk, want_fps);
+	if (apply_step >= 3) {
+		w32(m + L.clk_off, want_clk);
+		for (i = 0; i < (int)L.clk_n && i < 4; i++)
+			w32(m + L.clk_offs[i], want_clk);
+		if (L.priv_off && sv->priv_clk == src_clk) {
+			bool pok;
+			unsigned long sub = rptr(m + L.priv_off, &pok);
 
-		if (!kern(m) || rd(m + L.fps_off, &v, sizeof(v)))
-			return false;
-		if (v != 60 && v != 90 && v != 120) {
-			say("帧率校验失败：mode[%u] 读到 %u，不在 {60,90,120}", i, v);
-			return false;
+			if (pok && kern(sub)) {
+				say("  priv_info 时钟 %u -> %u", sv->priv_clk, want_clk);
+				w32(sub + L.priv_clk_off, want_clk);
+			}
 		}
-		if (v == 120)
-			n120++;
+		for (i = 0; i < (int)L.derived_n && i < 4; i++) {
+			u32 ov = sv->derived_vals[i];
+			u32 nv = (u32)((u64)ov * want_fps / 120);
+
+			if (ov) {
+				say("  派生 +0x%x: %u -> %u", L.derived[i], ov, nv);
+				w32(m + L.derived[i], nv);
+			}
+		}
 	}
-	if (n120 < 2) {
-		say("帧率校验失败：120 档只有 %u 条", n120);
-		return false;
+	if (apply_step >= 2)
+		w16(m + L.fps_off, (u16)want_fps);
+	if (apply_step >= 1 && L.transfer_off != U32_MAX && sv->transfer == src_transfer)
+		w32(m + L.transfer_off, want_transfer);
+	if (apply_step >= 4 && L.khz_off != U32_MAX && sv->khz) {
+		u32 nk = (u32)((u64)sv->khz * want_fps / 120);
+
+		say("  drm clock %u -> %u kHz", sv->khz, nk);
+		w32(m + L.khz_off, nk);
 	}
-	say("帧率序列校验通过（含 %u 条 120）", n120);
-	return true;
+	if (apply_step >= 5 && sv->have_adfr) {
+		bool ok;
+		unsigned long p = rptr(L.display + L.panel_off, &ok);
+
+		if (ok && kern(p)) {
+			say("  panel adfr 高刷表首元素 120 -> %u", want_fps);
+			w32(p + L.adfr_off, want_fps);
+		}
+	}
 }
 
 static int do_apply(void)
 {
+	struct save_rec *sv;
 	unsigned long m;
-	u32 khz_new;
-	int ret, i;
+	u16 f;
+	int i;
 
 	if (probe_only) {
 		say("probe_only=1，拒绝对内存做任何改动");
@@ -813,171 +828,85 @@ static int do_apply(void)
 		failure_code = 7;
 		return -EINVAL;
 	}
-	m = target_mode();
-	if (!m) {
+
+	saved_n = 0;
+	for (i = 0; i < (int)L.count && saved_n < MAX_PATCH; i++) {
+		m = mode_at(i);
+		if (!kern(m))
+			continue;
+		f = 0;
+		if (rd(m + L.fps_off, &f, sizeof(f)) || f != 120)
+			continue;
+		sv = &SAVED[saved_n];
+		if (save_original(m, sv))
+			continue;
+		patch_one(m, sv);
+		saved_n++;
+	}
+
+	if (!saved_n) {
+		say("没有可改写的 120 档");
 		failure_code = 5;
 		return -EFAULT;
 	}
-	ret = save_original(m);
-	if (ret)
-		return ret;
-
-	say("写入 mode=0x%lx（apply_step=%u）：clk %u->%u，fps->%u",
-	    m, apply_step, SAVE.clk, want_clk, want_fps);
-	/* 分步写入：上一步崩了就停在那一步，逐步定位到底哪个字段致命。
-	 * 0=只校验不写 1=transfer 2=+fps 3=+DSI 时钟 4=+drm kHz 5=+adfr/DT */
-	if (apply_step >= 3) {
-		w32(m + L.clk_off, want_clk);
-		for (i = 0; i < (int)L.clk_n && i < 4; i++)
-			w32(m + L.clk_offs[i], want_clk);
-		if (L.priv_off && SAVE.priv_clk == src_clk) {
-			bool pok;
-			unsigned long sub = rptr(m + L.priv_off, &pok);
-
-			if (pok && kern(sub)) {
-				say("  priv_info 时钟 %u -> %u", SAVE.priv_clk, want_clk);
-				w32(sub + L.priv_clk_off, want_clk);
-			}
-		}
-	}
-	if (apply_step >= 3) {
-		for (i = 0; i < (int)L.derived_n && i < 4; i++) {
-			u32 ov = SAVE.derived_vals[i];
-			u32 nv = (u32)((u64)ov * want_fps / 120);
-
-			if (ov) {
-				say("  派生 +0x%x: %u -> %u", L.derived[i], ov, nv);
-				w32(m + L.derived[i], nv);
-			}
-		}
-	}
-	if (apply_step >= 2) {
-		/* 一律只写 2 字节：即便它其实是 u32（高半为 0），结果等价；
-		 * 而若它真是 u16，写 4 字节会踩坏后面那个字段。 */
-		w16(m + L.fps_off, (u16)want_fps);
-	}
-	if (apply_step >= 1 && L.transfer_off != U32_MAX && SAVE.transfer == src_transfer)
-		w32(m + L.transfer_off, want_transfer);
-	if (apply_step >= 4 && L.khz_off != U32_MAX && SAVE.khz) {
-		khz_new = (u32)((u64)SAVE.khz * want_fps / 120);
-
-		say("  drm clock %u -> %u kHz", SAVE.khz, khz_new);
-		w32(m + L.khz_off, khz_new);
-	}
-	if (apply_step >= 5 && SAVE.have_adfr) {
-		bool ok;
-		unsigned long p = rptr(L.display + L.panel_off, &ok);
-
-		if (ok && kern(p)) {
-			say("  panel adfr 高刷表首元素 120 -> %u", want_fps);
-			w32(p + L.adfr_off, want_fps);
-		}
-	}
+	applied = (apply_step > 0);
 	if (apply_step >= 5) {
 		dt_adfr_rewrite(want_fps);
 		hook_adfr();
 	}
-	applied = (apply_step > 0);
-	say("已按 step=%u 应用。验收：切一次帧率，驱动日志应出现 fps=144 且 clk_rate=%u",
-	    apply_step, want_clk);
+	say("已按 step=%u 改写 %u 条 120 档。验收：切一次帧率，驱动日志应出现 fps=144 且 clk_rate=%u",
+	    apply_step, saved_n, want_clk);
 	return 0;
 }
 
-static int do_restore(void)
+static void restore_one(struct save_rec *sv)
 {
-	unsigned long m = target_mode();
+	unsigned long m = sv->mode;
 	int i;
 
-	if (!saved || !m)
-		return 0;
-	w32(m + L.clk_off, SAVE.clk);
-	for (i = 0; i < (int)SAVE.clk_n && i < 4; i++)
-		if (SAVE.clk_vals[i])
-			w32(m + L.clk_offs[i], SAVE.clk_vals[i]);
-	if (L.priv_off && SAVE.priv_clk) {
+	if (!kern(m))
+		return;
+	w32(m + L.clk_off, sv->clk);
+	for (i = 0; i < (int)sv->clk_n && i < 4; i++)
+		if (sv->clk_vals[i])
+			w32(m + L.clk_offs[i], sv->clk_vals[i]);
+	if (L.priv_off && sv->priv_clk) {
 		bool pok;
 		unsigned long sub = rptr(m + L.priv_off, &pok);
 
 		if (pok && kern(sub))
-			w32(sub + L.priv_clk_off, SAVE.priv_clk);
+			w32(sub + L.priv_clk_off, sv->priv_clk);
 	}
-	w16(m + L.fps_off, SAVE.fps16);
-	for (i = 0; i < (int)SAVE.derived_n && i < 4; i++)
-		if (SAVE.derived_vals[i])
-			w32(m + L.derived[i], SAVE.derived_vals[i]);
-	if (L.transfer_off != U32_MAX && SAVE.transfer)
-		w32(m + L.transfer_off, SAVE.transfer);
-	if (L.khz_off != U32_MAX && SAVE.khz)
-		w32(m + L.khz_off, SAVE.khz);
-	if (SAVE.have_adfr) {
+	w16(m + L.fps_off, sv->fps16);
+	for (i = 0; i < (int)sv->derived_n && i < 4; i++)
+		if (sv->derived_vals[i])
+			w32(m + L.derived[i], sv->derived_vals[i]);
+	if (L.transfer_off != U32_MAX && sv->transfer)
+		w32(m + L.transfer_off, sv->transfer);
+	if (L.khz_off != U32_MAX && sv->khz)
+		w32(m + L.khz_off, sv->khz);
+	if (sv->have_adfr) {
 		bool ok;
 		unsigned long p = rptr(L.display + L.panel_off, &ok);
 
 		if (ok && kern(p))
-			w32(p + L.adfr_off, SAVE.adfr);
+			w32(p + L.adfr_off, sv->adfr);
 	}
+}
+
+static int do_restore(void)
+{
+	u32 k;
+
+	for (k = 0; k < saved_n; k++)
+		restore_one(&SAVED[k]);
 	unhook_adfr();
+	saved_n = 0;
+	saved = false;
 	applied = false;
-	say("已还原 mode 的 120 档原值；重启一次最彻底");
+	say("已还原全部被改写的 120 档原值；重启一次最彻底");
 	return 0;
 }
-
-/* 把目标 mode 结构体的前 384 字节按 u32 打出来：参考样本还会改
- * mode_index / width / height 等字段，本机无法靠指纹确认，就一次打全，
- * 上机后据此判定。写 parameters/dump 触发，结果进 report。 */
-/* 只读诊断：mode0 的非零字段 + 四条 mode 的跨模式差分。
- * 真正随档位变化的字段会以 120/90/60/120 的形式暴露，
- * 比"单值恰好等于 120"可靠得多。 */
-static void dump_mode(void)
-{
-	unsigned long m0 = mode_at(0);
-	u32 off;
-
-	if (!kern(m0)) {
-		say("dump: 还没有 mode");
-		return;
-	}
-	say("dump stride=0x%x count=%u；mode0 非零字段：", L.stride, L.count);
-	for (off = 0; off + 4 <= L.stride; off += 4) {
-		u32 v = r32(m0 + off, NULL);
-
-		if (v)
-			say("  +0x%03x = 0x%x (%u)", off, v, v);
-	}
-	say("跨模式差分（值不全相同才列）：");
-	for (off = 0; off + 4 <= L.stride; off += 4) {
-		u32 v0 = r32(m0 + off, NULL), v1 = 0, v2 = 0, v3 = 0;
-		bool same = true;
-
-		if (L.count > 1) {
-			v1 = r32(mode_at(1) + off, NULL);
-			if (v1 != v0)
-				same = false;
-		}
-		if (L.count > 2) {
-			v2 = r32(mode_at(2) + off, NULL);
-			if (v2 != v0)
-				same = false;
-		}
-		if (L.count > 3) {
-			v3 = r32(mode_at(3) + off, NULL);
-			if (v3 != v0)
-				same = false;
-		}
-		if (!same)
-			say("  DIFF +0x%03x: %u %u %u %u", off, v0, v1, v2, v3);
-	}
-}
-
-static int dump_set(const char *val, const struct kernel_param *kp)
-{
-	dump_mode();
-	return 0;
-}
-
-static const struct kernel_param_ops dump_ops = { .set = dump_set };
-module_param_cb(dump, &dump_ops, NULL, 0200);
-MODULE_PARM_DESC(dump, "写任意值把目标 mode 结构体前 384 字节打进 report");
 
 static int report_get(char *buf, const struct kernel_param *kp)
 {

@@ -83,23 +83,7 @@ static struct {
 } L;
 
 #define MAX_PATCH 4
-struct save_rec {
-	unsigned long mode;
-	u32 clk;
-	u32 clk_vals[4];
-	u32 clk_n;
-	u32 derived_vals[4];
-	u32 derived_n;
-	u32 priv_clk;
-	u32 fps32;
-	u16 fps16;
-	u32 transfer;
-	u32 khz;
-	u32 adfr;
-	bool have_adfr;
-};
-static struct save_rec SAVED[MAX_PATCH];
-static u32 saved_n;
+
 static int adfr_calls;
 
 static char report[REPORT_CAP];
@@ -737,102 +721,36 @@ static void unhook_adfr(void)
 
 
 
-static int save_original(unsigned long m, struct save_rec *sv)
-{
-	bool ok;
-	int i;
+struct layinfo {
+	unsigned long base;
+	u32 stride;
+	u32 clk_off;
+	u32 fps_off;
+	u32 fps_u16;
+	u32 transfer_off;
+	u32 derived[4];
+	u32 derived_n;
+	u32 count;
+};
+static struct layinfo LAY[4];
+static u32 lay_n;
 
-	sv->mode = m;
-	sv->clk = r32(m + L.clk_off, &ok);
-	if (!ok || sv->clk != src_clk) {
-		say("槽 0x%lx 当前 clk=%u 不是 %u，跳过", m, sv->clk, src_clk);
-		return -EIO;
-	}
-	sv->clk_n = L.clk_n;
-	for (i = 0; i < (int)L.clk_n && i < 4; i++)
-		sv->clk_vals[i] = r32(m + L.clk_offs[i], NULL);
-	sv->derived_n = L.derived_n;
-	for (i = 0; i < (int)L.derived_n && i < 4; i++)
-		sv->derived_vals[i] = r32(m + L.derived[i], NULL);
-	sv->priv_clk = 0;
-	if (L.priv_off) {
-		unsigned long sub = rptr(m + L.priv_off, &ok);
+struct save_rec {
+	u32 lay;
+	u32 slot;
+	unsigned long mode;
+	u32 clk;
+	u32 clk_vals[4];
+	u32 clk_n;
+	u32 derived_vals[4];
+	u32 derived_n;
+	u16 fps16;
+	u32 transfer;
+};
+static struct save_rec SAVED[MAX_PATCH];
+static u32 saved_n;
 
-		if (ok && kern(sub))
-			sv->priv_clk = r32(sub + L.priv_clk_off, NULL);
-	}
-	{
-		u16 v = 0;
-
-		if (rd(m + L.fps_off, &v, sizeof(v)))
-			return -EIO;
-		sv->fps16 = v;
-	}
-	sv->transfer = (L.transfer_off != U32_MAX) ? r32(m + L.transfer_off, NULL) : 0;
-	sv->khz = (L.khz_off != U32_MAX) ? r32(m + L.khz_off, NULL) : 0;
-	sv->have_adfr = false;
-	if (L.panel_off && L.adfr_off != U32_MAX) {
-		unsigned long p = rptr(L.display + L.panel_off, &ok);
-
-		if (ok && kern(p)) {
-			sv->adfr = r32(p + L.adfr_off, NULL);
-			sv->have_adfr = (sv->adfr == src_adfr[0]);
-		}
-	}
-	return 0;
-}
-
-static void patch_one(unsigned long m, struct save_rec *sv)
-{
-	int i;
-
-	say("写入 mode=0x%lx（step=%u）：clk %u->%u fps->%u",
-	    m, apply_step, sv->clk, want_clk, want_fps);
-	if (apply_step >= 3) {
-		w32(m + L.clk_off, want_clk);
-		for (i = 0; i < (int)L.clk_n && i < 4; i++)
-			w32(m + L.clk_offs[i], want_clk);
-		if (L.priv_off && sv->priv_clk == src_clk) {
-			bool pok;
-			unsigned long sub = rptr(m + L.priv_off, &pok);
-
-			if (pok && kern(sub)) {
-				say("  priv_info 时钟 %u -> %u", sv->priv_clk, want_clk);
-				w32(sub + L.priv_clk_off, want_clk);
-			}
-		}
-		for (i = 0; i < (int)L.derived_n && i < 4; i++) {
-			u32 ov = sv->derived_vals[i];
-			u32 nv = (u32)((u64)ov * want_fps / 120);
-
-			if (ov) {
-				say("  派生 +0x%x: %u -> %u", L.derived[i], ov, nv);
-				w32(m + L.derived[i], nv);
-			}
-		}
-	}
-	if (apply_step >= 2)
-		w16(m + L.fps_off, (u16)want_fps);
-	if (apply_step >= 1 && L.transfer_off != U32_MAX && sv->transfer == src_transfer)
-		w32(m + L.transfer_off, want_transfer);
-	if (apply_step >= 4 && L.khz_off != U32_MAX && sv->khz) {
-		u32 nk = (u32)((u64)sv->khz * want_fps / 120);
-
-		say("  drm clock %u -> %u kHz", sv->khz, nk);
-		w32(m + L.khz_off, nk);
-	}
-	if (apply_step >= 5 && sv->have_adfr) {
-		bool ok;
-		unsigned long p = rptr(L.display + L.panel_off, &ok);
-
-		if (ok && kern(p)) {
-			say("  panel adfr 高刷表首元素 120 -> %u", want_fps);
-			w32(p + L.adfr_off, want_fps);
-		}
-	}
-}
-
-/* 帧率字段必须在每条 mode 上都呈现档位值；只是某处恰好 120 不算证据。 */
+/* 帧率字段必须在每条 mode 上都呈现档位值。 */
 static bool fps_sequence_ok(void)
 {
 	u32 i, n120 = 0;
@@ -852,7 +770,7 @@ static bool fps_sequence_ok(void)
 		if (v == 120)
 			n120++;
 	}
-	if (n120 < 1) {
+	if (!n120) {
 		say("帧率校验失败：没有 120 档");
 		return false;
 	}
@@ -860,12 +778,207 @@ static bool fps_sequence_ok(void)
 	return true;
 }
 
+/* 用"时钟全等 + 帧率序列 120/90/60/120"识别任意一份 mode 数组副本 */
+static bool match_extra_array(unsigned long arr, u32 count, struct layinfo *o)
+{
+	u32 clk_off, fps_off, u16f, stride, i, n120;
+	u32 v0;
+
+	if (!kern(arr))
+		return false;
+	clk_off = find_u32(arr, src_clk, 0x400);
+	if (clk_off == U32_MAX)
+		return false;
+	for (stride = 0x40; stride <= 0x800; stride += 8) {
+		if (!is32(arr + stride + clk_off, src_clk))
+			continue;
+		if (count > 2 && !is32(arr + 2 * stride + clk_off, src_clk))
+			continue;
+		if (count > 3 && !is32(arr + 3 * stride + clk_off, src_clk))
+			continue;
+
+		fps_off = find_u32(arr, 120, stride);
+		u16f = 0;
+		if (fps_off == U32_MAX || fps_off == clk_off) {
+			fps_off = find_u16(arr, 120, stride);
+			u16f = 1;
+		}
+		if (fps_off == U32_MAX || fps_off == clk_off)
+			continue;
+
+		n120 = 0;
+		for (i = 0; i < count; i++) {
+			u32 f;
+
+			if (u16f) {
+				u16 v = 0;
+
+				if (rd(arr + i * stride + fps_off, &v, sizeof(v)))
+					break;
+				f = v;
+			} else {
+				f = r32(arr + i * stride + fps_off, NULL);
+			}
+			if (f == 120) {
+				n120++;
+				continue;
+			}
+			if (f != 60 && f != 90)
+				break;
+		}
+		if (i < count || n120 < 2)
+			continue;
+
+		o->base = arr;
+		o->stride = stride;
+		o->clk_off = clk_off;
+		o->fps_off = fps_off;
+		o->fps_u16 = u16f;
+		o->transfer_off = find_u32(arr, src_transfer, stride);
+		o->count = count;
+		o->derived_n = 0;
+
+		{
+			u16 f0 = 0;
+			u32 off;
+
+			if (!rd(arr + fps_off, &f0, sizeof(f0)) && f0) {
+				for (off = 0; off + 4 <= stride && o->derived_n < 4; off += 4) {
+					bool ok;
+					bool good = true;
+
+					if (off == fps_off || off == clk_off)
+						continue;
+					v0 = r32(arr + off, &ok);
+					if (!ok || !v0)
+						continue;
+					for (i = 1; i < count; i++) {
+						u16 fi = 0;
+						u32 vi = r32(arr + i * stride + off, NULL);
+
+						if (rd(arr + i * stride + fps_off, &fi, sizeof(fi)) || !fi || !vi ||
+						    (u64)v0 * fi != (u64)vi * f0) {
+							good = false;
+							break;
+						}
+					}
+					if (good)
+						o->derived[o->derived_n++] = off;
+				}
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
+/* 在对象里扫指针槽，找出所有同签名数组 */
+static void scan_object_arrays(unsigned long obj, u32 win, u32 count, const char *tag)
+{
+	u32 slot;
+
+	for (slot = 0; slot + 8 <= win && lay_n < 4; slot += 8) {
+		bool ok;
+		unsigned long arr = rptr(obj + slot, &ok);
+
+		if (!ok || !kern(arr))
+			continue;
+		if (match_extra_array(arr, count, &LAY[lay_n])) {
+			say("%s+0x%x 同签名数组 0x%lx stride=0x%x fps_off=0x%x clk_off=0x%x 派生%u",
+			    tag, slot, arr, LAY[lay_n].stride, LAY[lay_n].fps_off,
+			    LAY[lay_n].clk_off, LAY[lay_n].derived_n);
+			lay_n++;
+		}
+	}
+}
+
+static void build_layouts(unsigned long display, u32 count)
+{
+	bool ok;
+	unsigned long panel;
+	u32 i;
+
+	lay_n = 0;
+	LAY[0].base = L.modes_arr;
+	LAY[0].stride = L.stride;
+	LAY[0].clk_off = L.clk_off;
+	LAY[0].fps_off = L.fps_off;
+	LAY[0].fps_u16 = L.fps_u16;
+	LAY[0].transfer_off = L.transfer_off;
+	LAY[0].count = L.count;
+	LAY[0].derived_n = L.derived_n;
+	for (i = 0; i < L.derived_n && i < 4; i++)
+		LAY[0].derived[i] = L.derived[i];
+	lay_n = 1;
+
+	/* 参考实现同时改 panel 侧副本；这里把所有同签名数组都找出来 */
+	if (L.panel_off) {
+		panel = rptr(display + L.panel_off, &ok);
+		if (ok && kern(panel))
+			scan_object_arrays(panel, 0x1000, count, "panel");
+	}
+	say("共找到 %u 份 mode 数组", lay_n);
+}
+
+static unsigned long lay_mode(u32 lay, u32 slot)
+{
+	return LAY[lay].base + (unsigned long)slot * LAY[lay].stride;
+}
+
+static int save_one(u32 lay, u32 slot, struct save_rec *sv)
+{
+	unsigned long m = lay_mode(lay, slot);
+	u16 f = 0;
+	int i;
+
+	sv->lay = lay;
+	sv->slot = slot;
+	sv->mode = m;
+	sv->clk = r32(m + LAY[lay].clk_off, NULL);
+	sv->clk_n = 1;
+	sv->clk_vals[0] = sv->clk;
+	if (rd(m + LAY[lay].fps_off, &f, sizeof(f)))
+		return -EIO;
+	sv->fps16 = f;
+	sv->transfer = (LAY[lay].transfer_off != U32_MAX) ?
+		r32(m + LAY[lay].transfer_off, NULL) : 0;
+	sv->derived_n = LAY[lay].derived_n;
+	for (i = 0; i < (int)LAY[lay].derived_n && i < 4; i++)
+		sv->derived_vals[i] = r32(m + LAY[lay].derived[i], NULL);
+	return 0;
+}
+
+static void patch_saved(struct save_rec *sv)
+{
+	unsigned long m = sv->mode;
+	struct layinfo *ly = &LAY[sv->lay];
+	int i;
+
+	say("写入 lay%u slot%u mode=0x%lx（step=%u）：clk %u->%u fps %u->%u",
+	    sv->lay, sv->slot, m, apply_step, sv->clk, want_clk, sv->fps16, want_fps);
+	if (apply_step >= 3)
+		w32(m + ly->clk_off, want_clk);
+	if (apply_step >= 2)
+		w16(m + ly->fps_off, (u16)want_fps);
+	if (apply_step >= 3) {
+		for (i = 0; i < (int)ly->derived_n && i < 4; i++) {
+			u32 ov = sv->derived_vals[i];
+			u32 nv = (u32)((u64)ov * want_fps / 120);
+
+			if (ov) {
+				say("  派生 +0x%x: %u -> %u", ly->derived[i], ov, nv);
+				w32(m + ly->derived[i], nv);
+			}
+		}
+	}
+	if (apply_step >= 1 && ly->transfer_off != U32_MAX && sv->transfer == src_transfer)
+		w32(m + ly->transfer_off, want_transfer);
+}
+
 static int do_apply(void)
 {
 	struct save_rec *sv;
-	unsigned long m;
-	u16 f;
-	int i;
+	u32 i, slot;
 
 	if (probe_only) {
 		say("probe_only=1，拒绝对内存做任何改动");
@@ -882,19 +995,21 @@ static int do_apply(void)
 		return -EINVAL;
 	}
 
+	build_layouts((unsigned long)L.display, L.count);
 	saved_n = 0;
-	for (i = 0; i < (int)L.count && saved_n < MAX_PATCH; i++) {
-		m = mode_at(i);
-		if (!kern(m))
-			continue;
-		f = 0;
-		if (rd(m + L.fps_off, &f, sizeof(f)) || f != 120)
-			continue;
-		sv = &SAVED[saved_n];
-		if (save_original(m, sv))
-			continue;
-		patch_one(m, sv);
-		saved_n++;
+	for (i = 0; i < lay_n && saved_n < MAX_PATCH; i++) {
+		for (slot = 0; slot < LAY[i].count && saved_n < MAX_PATCH; slot++) {
+			u16 f = 0;
+			unsigned long m = lay_mode(i, slot);
+
+			if (!kern(m) || rd(m + LAY[i].fps_off, &f, sizeof(f)) || f != 120)
+				continue;
+			sv = &SAVED[saved_n];
+			if (save_one(i, slot, sv))
+				continue;
+			patch_saved(sv);
+			saved_n++;
+		}
 	}
 
 	if (!saved_n) {
@@ -902,49 +1017,30 @@ static int do_apply(void)
 		failure_code = 5;
 		return -EFAULT;
 	}
-	applied = (apply_step > 0);
 	if (apply_step >= 5) {
 		dt_adfr_rewrite(want_fps);
 		hook_adfr();
 	}
-	say("已按 step=%u 改写 %u 条 120 档。验收：切一次帧率，驱动日志应出现 fps=144 且 clk_rate=%u",
-	    apply_step, saved_n, want_clk);
+	applied = (apply_step > 0);
+	say("已按 step=%u 改写 %u 条 120 档（跨 %u 份数组）", apply_step, saved_n, lay_n);
 	return 0;
 }
 
 static void restore_one(struct save_rec *sv)
 {
 	unsigned long m = sv->mode;
+	struct layinfo *ly = &LAY[sv->lay];
 	int i;
 
 	if (!kern(m))
 		return;
-	w32(m + L.clk_off, sv->clk);
-	for (i = 0; i < (int)sv->clk_n && i < 4; i++)
-		if (sv->clk_vals[i])
-			w32(m + L.clk_offs[i], sv->clk_vals[i]);
-	if (L.priv_off && sv->priv_clk) {
-		bool pok;
-		unsigned long sub = rptr(m + L.priv_off, &pok);
-
-		if (pok && kern(sub))
-			w32(sub + L.priv_clk_off, sv->priv_clk);
-	}
-	w16(m + L.fps_off, sv->fps16);
-	for (i = 0; i < (int)sv->derived_n && i < 4; i++)
+	w32(m + ly->clk_off, sv->clk);
+	w16(m + ly->fps_off, sv->fps16);
+	for (i = 0; i < (int)ly->derived_n && i < 4; i++)
 		if (sv->derived_vals[i])
-			w32(m + L.derived[i], sv->derived_vals[i]);
-	if (L.transfer_off != U32_MAX && sv->transfer)
-		w32(m + L.transfer_off, sv->transfer);
-	if (L.khz_off != U32_MAX && sv->khz)
-		w32(m + L.khz_off, sv->khz);
-	if (sv->have_adfr) {
-		bool ok;
-		unsigned long p = rptr(L.display + L.panel_off, &ok);
-
-		if (ok && kern(p))
-			w32(p + L.adfr_off, sv->adfr);
-	}
+			w32(m + ly->derived[i], sv->derived_vals[i]);
+	if (ly->transfer_off != U32_MAX && sv->transfer)
+		w32(m + ly->transfer_off, sv->transfer);
 }
 
 static int do_restore(void)

@@ -714,6 +714,35 @@ static int save_original(unsigned long m)
 	return 0;
 }
 
+/* 帧率字段必须在四条 mode 上呈现 120/90/60/120 这种档位序列；
+ * 只是"某个位置恰好等于 120"不算证据。上一版崩机就是缺这道闸。 */
+static bool fps_sequence_ok(void)
+{
+	u32 i, n120 = 0;
+
+	if (L.count < 2)
+		return false;
+	for (i = 0; i < L.count; i++) {
+		unsigned long m = mode_at(i);
+		u16 v = 0;
+
+		if (!kern(m) || rd(m + L.fps_off, &v, sizeof(v)))
+			return false;
+		if (v != 60 && v != 90 && v != 120) {
+			say("帧率校验失败：mode[%u] 读到 %u，不在 {60,90,120}", i, v);
+			return false;
+		}
+		if (v == 120)
+			n120++;
+	}
+	if (n120 < 2) {
+		say("帧率校验失败：120 档只有 %u 条", n120);
+		return false;
+	}
+	say("帧率序列校验通过（含 %u 条 120）", n120);
+	return true;
+}
+
 static int do_apply(void)
 {
 	unsigned long m;
@@ -730,6 +759,10 @@ static int do_apply(void)
 		failure_code = 3;
 		return -ENOENT;
 	}
+	if (!fps_sequence_ok()) {
+		failure_code = 7;
+		return -EINVAL;
+	}
 	m = target_mode();
 	if (!m) {
 		failure_code = 5;
@@ -739,31 +772,38 @@ static int do_apply(void)
 	if (ret)
 		return ret;
 
-	say("写入 mode=0x%lx：clk %u->%u，fps->%u", m, SAVE.clk, want_clk, want_fps);
-	w32(m + L.clk_off, want_clk);
-	for (i = 0; i < (int)L.clk_n && i < 4; i++)
-		w32(m + L.clk_offs[i], want_clk);
-	if (L.priv_off && SAVE.priv_clk == src_clk) {
-		bool pok;
-		unsigned long sub = rptr(m + L.priv_off, &pok);
+	say("写入 mode=0x%lx（apply_step=%u）：clk %u->%u，fps->%u",
+	    m, apply_step, SAVE.clk, want_clk, want_fps);
+	/* 分步写入：上一步崩了就停在那一步，逐步定位到底哪个字段致命。
+	 * 0=只校验不写 1=transfer 2=+fps 3=+DSI 时钟 4=+drm kHz 5=+adfr/DT */
+	if (apply_step >= 3) {
+		w32(m + L.clk_off, want_clk);
+		for (i = 0; i < (int)L.clk_n && i < 4; i++)
+			w32(m + L.clk_offs[i], want_clk);
+		if (L.priv_off && SAVE.priv_clk == src_clk) {
+			bool pok;
+			unsigned long sub = rptr(m + L.priv_off, &pok);
 
-		if (pok && kern(sub)) {
-			say("  priv_info 时钟 %u -> %u", SAVE.priv_clk, want_clk);
-			w32(sub + L.priv_clk_off, want_clk);
+			if (pok && kern(sub)) {
+				say("  priv_info 时钟 %u -> %u", SAVE.priv_clk, want_clk);
+				w32(sub + L.priv_clk_off, want_clk);
+			}
 		}
 	}
-	/* 一律只写 2 字节：即便它其实是 u32（高半为 0），结果等价；
-	 * 而若它真是 u16，写 4 字节会踩坏后面那个字段。 */
-	w16(m + L.fps_off, (u16)want_fps);
-	if (L.transfer_off != U32_MAX && SAVE.transfer == src_transfer)
+	if (apply_step >= 2) {
+		/* 一律只写 2 字节：即便它其实是 u32（高半为 0），结果等价；
+		 * 而若它真是 u16，写 4 字节会踩坏后面那个字段。 */
+		w16(m + L.fps_off, (u16)want_fps);
+	}
+	if (apply_step >= 1 && L.transfer_off != U32_MAX && SAVE.transfer == src_transfer)
 		w32(m + L.transfer_off, want_transfer);
-	if (L.khz_off != U32_MAX && SAVE.khz) {
+	if (apply_step >= 4 && L.khz_off != U32_MAX && SAVE.khz) {
 		khz_new = (u32)((u64)SAVE.khz * want_fps / 120);
 
 		say("  drm clock %u -> %u kHz", SAVE.khz, khz_new);
 		w32(m + L.khz_off, khz_new);
 	}
-	if (SAVE.have_adfr) {
+	if (apply_step >= 5 && SAVE.have_adfr) {
 		bool ok;
 		unsigned long p = rptr(L.display + L.panel_off, &ok);
 
@@ -772,10 +812,13 @@ static int do_apply(void)
 			w32(p + L.adfr_off, want_fps);
 		}
 	}
-	dt_adfr_rewrite(want_fps);
-	hook_adfr();
-	applied = true;
-	say("已应用。验收：切一次帧率，驱动日志必须出现 fps=144 且 clk_rate=%u", want_clk);
+	if (apply_step >= 5) {
+		dt_adfr_rewrite(want_fps);
+		hook_adfr();
+	}
+	applied = (apply_step > 0);
+	say("已按 step=%u 应用。验收：切一次帧率，驱动日志应出现 fps=144 且 clk_rate=%u",
+	    apply_step, want_clk);
 	return 0;
 }
 
@@ -818,26 +861,47 @@ static int do_restore(void)
 /* 把目标 mode 结构体的前 384 字节按 u32 打出来：参考样本还会改
  * mode_index / width / height 等字段，本机无法靠指纹确认，就一次打全，
  * 上机后据此判定。写 parameters/dump 触发，结果进 report。 */
+/* 只读诊断：mode0 的非零字段 + 四条 mode 的跨模式差分。
+ * 真正随档位变化的字段会以 120/90/60/120 的形式暴露，
+ * 比"单值恰好等于 120"可靠得多。 */
 static void dump_mode(void)
 {
-	unsigned long m = target_mode();
+	unsigned long m0 = mode_at(0);
 	u32 off;
 
-	if (!m) {
-		say("dump: 还没有目标 mode");
+	if (!kern(m0)) {
+		say("dump: 还没有 mode");
 		return;
 	}
-	say("dump mode=0x%lx（每行 4 组 偏移=值）", m);
-	for (off = 0; off + 4 <= 384; off += 4) {
-		bool ok;
-		u32 v = r32(m + off, &ok);
+	say("dump stride=0x%x count=%u；mode0 非零字段：", L.stride, L.count);
+	for (off = 0; off + 4 <= L.stride; off += 4) {
+		u32 v = r32(m0 + off, NULL);
 
-		if (!ok)
-			break;
-		if (off % 16 == 0)
-			say("  +0x%03x: 0x%x", off, v);
-		else
-			say("          +0x%03x: 0x%x", off, v);
+		if (v)
+			say("  +0x%03x = 0x%x (%u)", off, v, v);
+	}
+	say("跨模式差分（值不全相同才列）：");
+	for (off = 0; off + 4 <= L.stride; off += 4) {
+		u32 v0 = r32(m0 + off, NULL), v1 = 0, v2 = 0, v3 = 0;
+		bool same = true;
+
+		if (L.count > 1) {
+			v1 = r32(mode_at(1) + off, NULL);
+			if (v1 != v0)
+				same = false;
+		}
+		if (L.count > 2) {
+			v2 = r32(mode_at(2) + off, NULL);
+			if (v2 != v0)
+				same = false;
+		}
+		if (L.count > 3) {
+			v3 = r32(mode_at(3) + off, NULL);
+			if (v3 != v0)
+				same = false;
+		}
+		if (!same)
+			say("  DIFF +0x%03x: %u %u %u %u", off, v0, v1, v2, v3);
 	}
 }
 
@@ -928,6 +992,9 @@ module_param(probe_only, bool, 0644);
 module_param(want_clk, uint, 0644);
 module_param(want_fps, uint, 0644);
 module_param(want_transfer, uint, 0644);
+static u32 apply_step;
+module_param(apply_step, uint, 0644);
+MODULE_PARM_DESC(apply_step, "分步写入 0=只校验 1=transfer 2=+fps 3=+DSI时钟 4=+drm kHz 5=+adfr/DT");
 module_param(want_slot, int, 0644);
 module_param(src_clk, uint, 0444);
 module_param_string(panel_node, panel_node, sizeof(panel_node), 0444);

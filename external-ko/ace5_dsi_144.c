@@ -288,7 +288,7 @@ static bool try_contig_at(unsigned long d, u32 slot, u32 count)
 {
 	bool ok;
 	unsigned long arr = rptr(d + slot, &ok);
-	u32 clk_off, fps_off = U32_MAX, stride, i;
+	u32 clk_off, fps_off = U32_MAX, stride, i, var_u16;
 	int last120 = -1, n120 = 0;
 
 	if (!ok || !kern(arr))
@@ -306,12 +306,26 @@ static bool try_contig_at(unsigned long d, u32 slot, u32 count)
 			continue;
 
 		fps_off = find_u32(arr, 120, stride);
+		var_u16 = 0;
+		if (fps_off == U32_MAX || fps_off == clk_off) {
+			fps_off = find_u16(arr, 120, stride);
+			var_u16 = 1;
+		}
 		if (fps_off == U32_MAX || fps_off == clk_off)
 			continue;
 		n120 = 0; last120 = -1;
 		for (i = 0; i < count; i++) {
-			u32 f = r32(arr + i * stride + fps_off, NULL);
+			u32 f;
 
+			if (var_u16) {
+				u16 v = 0;
+
+				if (rd(arr + i * stride + fps_off, &v, sizeof(v)))
+					break;
+				f = v;
+			} else {
+				f = r32(arr + i * stride + fps_off, NULL);
+			}
 			if (f == 120) { n120++; last120 = i; }
 			else if (f != 60 && f != 90)
 				break;
@@ -325,13 +339,13 @@ static bool try_contig_at(unsigned long d, u32 slot, u32 count)
 		L.contig = 1;
 		L.clk_off = clk_off;
 		L.fps_off = fps_off;
-		L.fps_u16 = 0;
+		L.fps_u16 = var_u16;
 		L.count = count;
 		L.slot = want_slot >= 0 && want_slot < (int)count ? want_slot : last120;
 		L.transfer_off = find_u32(arr, src_transfer, stride);
 		L.khz_off = find_khz(arr);
-		say("连续数组命中：display+0x%x -> 0x%lx stride=0x%x clk_off=0x%x fps_off=0x%x 120数=%d 槽=%d",
-		    slot, arr, stride, clk_off, fps_off, n120, L.slot);
+		say("连续数组命中 display+0x%x -> 0x%lx stride=0x%x clk_off=0x%x fps_off=0x%x(%s) 120数=%d 槽=%d",
+		    slot, arr, stride, clk_off, fps_off, var_u16 ? "u16" : "u32", n120, L.slot);
 		return true;
 	}
 	return false;

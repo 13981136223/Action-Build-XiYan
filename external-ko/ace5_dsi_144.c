@@ -847,7 +847,7 @@ static int state_get(char *buf, const struct kernel_param *kp)
 	return scnprintf(buf, 4000,
 		"display=0x%lx layout=%d applied=%d probe_only=%d fail=%u slot=%d count=%u "
 		"modes_off=0x%x arr=0x%lx clk_off=0x%x fps_off=0x%x(%s) transfer_off=0x%x "
-		"khz_off=0x%x panel_off=0x%x adfr_off=0x%x clk_n=%u priv_off=0x%x priv_clk_off=0x%x adfr_calls=%d\n",
+		"khz_off=0x%x panel_off=0x%x adfr_off=0x%x clk_n=%u priv_off=0x%x priv_clk_off=0x%x contig=%u stride=0x%x adfr_calls=%d\n",
 		L.display, layout_ok, applied, probe_only, failure_code, L.slot, L.count,
 		L.modes_off, L.modes_arr, L.clk_off, L.fps_off, L.fps_u16 ? "u16" : "u32",
 		L.transfer_off, L.khz_off, L.panel_off, L.adfr_off, L.clk_n, L.priv_off, L.priv_clk_off, L.contig, L.stride, adfr_calls);

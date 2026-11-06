@@ -664,6 +664,27 @@ static int capture_display(struct kprobe *p, struct pt_regs *regs)
 	return 0;
 }
 
+static int setmode_seen;
+static int watch_setmode(struct kprobe *p, struct pt_regs *regs)
+{
+	unsigned long mode = regs->regs[1];
+	u16 fps = 0;
+	u32 clk = 0;
+	int i, mine = -1;
+
+	if (setmode_seen >= 6 || !kern(mode))
+		return 0;
+	setmode_seen++;
+	rd(mode + L.fps_off, &fps, sizeof(fps));
+	clk = r32(mode + L.clk_off, NULL);
+	for (i = 0; i < (int)saved_n; i++)
+		if (SAVED[i].mode == mode)
+			mine = i;
+	say("set_mode arg1=%px fps=%u clk=%u 我们的第%d条%s", (void *)mode, fps, clk,
+	    mine, mine >= 0 ? "（同一对象）" : "（不是我们改的对象）");
+	return 0;
+}
+
 static int watch_adfr(struct kprobe *p, struct pt_regs *regs)
 {
 	adfr_calls++;		/* 一期只观测，不猜参数语义 */
@@ -678,6 +699,10 @@ static struct kprobe kp_disp = {
 static struct kprobe kp_val = {
 	.symbol_name = "dsi_display_validate_mode",
 	.pre_handler = capture_display,
+};
+static struct kprobe kp_setmode = {
+	.symbol_name = "dsi_display_set_mode",
+	.pre_handler = watch_setmode,
 };
 static struct kprobe kp_adfr = {
 	.symbol_name = "oplus_adfr_property_update",
@@ -1037,6 +1062,9 @@ static int __init ace5_144_init(void)
 		failure_code = 10;
 		return ret;
 	}
+	ret = register_kprobe(&kp_setmode);
+	if (ret)
+		say("注册 dsi_display_set_mode 探针失败 ret=%d", ret);
 	ret = register_kprobe(&kp_val);
 	if (ret)
 		say("注册 dsi_display_validate_mode 失败 ret=%d（有 prepare 兜底）", ret);
@@ -1051,6 +1079,8 @@ static void __exit ace5_144_exit(void)
 	unregister_kprobe(&kp_disp);
 	if (kp_val.addr)
 		unregister_kprobe(&kp_val);
+	if (kp_setmode.addr)
+		unregister_kprobe(&kp_setmode);
 	unhook_adfr();
 	pr_info(TAG ": unloaded\n");
 }

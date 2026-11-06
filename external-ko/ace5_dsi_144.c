@@ -55,7 +55,8 @@ static bool probe_only = true;
 static bool applied;
 static bool layout_ok;
 static u32 failure_code;
-static int want_slot = -1;		/* -1 = 自动选最后一条 120 */
+static int want_slot = -1;
+static u32 apply_step;		/* 0=只校验 1=transfer 2=+fps 3=+DSI时钟 4=+kHz 5=+adfr/DT */		/* -1 = 自动选最后一条 120 */
 static char panel_node[64] = "qcom,mdss_dsi_panel_AA577_P_3_A0020_dsc_cmd";
 
 static struct {
@@ -992,7 +993,6 @@ module_param(probe_only, bool, 0644);
 module_param(want_clk, uint, 0644);
 module_param(want_fps, uint, 0644);
 module_param(want_transfer, uint, 0644);
-static u32 apply_step;
 module_param(apply_step, uint, 0644);
 MODULE_PARM_DESC(apply_step, "分步写入 0=只校验 1=transfer 2=+fps 3=+DSI时钟 4=+drm kHz 5=+adfr/DT");
 module_param(want_slot, int, 0644);

@@ -57,7 +57,7 @@ static bool layout_ok;
 static u32 failure_code;
 static int want_slot = -1;
 static u32 apply_step;
-static bool keep_fps;		/* 0=只校验 1=transfer 2=+fps 3=+DSI时钟 4=+kHz 5=+adfr/DT */		/* -1 = 自动选最后一条 120 */
+static bool keep_fps;		/* 1=不改帧率标签，只把时钟/transfer 按 144 下发 */
 static char panel_node[64] = "qcom,mdss_dsi_panel_AA577_P_3_A0020_dsc_cmd";
 
 static struct {
@@ -901,6 +901,51 @@ static unsigned long lay_mode(u32 lay, u32 slot)
 	return LAY[lay].base + (unsigned long)slot * LAY[lay].stride;
 }
 
+/* 抓 dsi_display_set_mode 实际拿到的 mode 指针：判断驱动编程的是不是我们
+ * 改过的那份数组。只记前几次，避免刷屏。 */
+static int setmode_logs;
+static unsigned long setmode_last;
+
+static int watch_setmode(struct kprobe *p, struct pt_regs *regs)
+{
+	unsigned long m = regs->regs[1];
+	u16 f16 = 0;
+	u32 fps = 0, clk = 0, pix = 0;
+	int lay = -1, slot = -1;
+	u32 k, i;
+
+	if (!kern(m) || m == setmode_last || setmode_logs >= 8)
+		return 0;
+	setmode_last = m;
+	setmode_logs++;
+
+	for (k = 0; k < lay_n; k++) {
+		for (i = 0; i < LAY[k].count; i++) {
+			if (m == lay_mode(k, i)) {
+				lay = (int)k;
+				slot = (int)i;
+			}
+		}
+	}
+	if (layout_ok) {
+		rd(m + L.fps_off, &f16, sizeof(f16));
+		fps = f16;
+		clk = r32(m + L.clk_off, NULL);
+		if (L.derived_n)
+			pix = r32(m + L.derived[0], NULL);
+	}
+	say("set_mode disp=0x%lx mode=0x%lx %s lay=%d slot=%d fps=%u clk=%u pix=%u",
+	    (unsigned long)regs->regs[0], m,
+	    lay >= 0 ? "在扫描数组内" : "不在扫描数组内",
+	    lay, slot, fps, clk, pix);
+	return 0;
+}
+
+static struct kprobe kp_setmode = {
+	.symbol_name = "dsi_display_set_mode",
+	.pre_handler = watch_setmode,
+};
+
 static int save_one(u32 lay, u32 slot, struct save_rec *sv)
 {
 	unsigned long m = lay_mode(lay, slot);
@@ -1139,6 +1184,9 @@ static int __init ace5_144_init(void)
 	ret = register_kprobe(&kp_val);
 	if (ret)
 		say("注册 dsi_display_validate_mode 失败 ret=%d（有 prepare 兜底）", ret);
+	ret = register_kprobe(&kp_setmode);
+	if (ret)
+		say("注册 dsi_display_set_mode 失败 ret=%d（仅少一份指针取证）", ret);
 	say("loaded：等一次显示操作（息屏亮屏）触发布局发现，然后读 parameters/state");
 	return 0;
 }
@@ -1150,6 +1198,8 @@ static void __exit ace5_144_exit(void)
 	unregister_kprobe(&kp_disp);
 	if (kp_val.addr)
 		unregister_kprobe(&kp_val);
+	if (kp_setmode.addr)
+		unregister_kprobe(&kp_setmode);
 	unhook_adfr();
 	pr_info(TAG ": unloaded\n");
 }

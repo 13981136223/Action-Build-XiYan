@@ -1675,7 +1675,7 @@ jobs:
           # 不补就死在 ../fs/susfs.c:77 / :154: call to undeclared function。
           # 只补一个等价宏：有 SUSFS_LOGI 就转过去，没有就空实现，不改任何逻辑。
           H=include/linux/susfs.h
-          if [ -f "$H" ] && ! grep -q SUSFS_LOGI_RL "$H"; then
+          if [ -f "$H" ]; then
             {
               printf '%s\n' '/* 由 CI 补齐：上游 susfs.c 用到的限速日志宏 */'
               printf '%s\n' '#ifndef SUSFS_LOGI_RL'
@@ -1688,7 +1688,7 @@ jobs:
             } >> "$H"
             echo "已在 $H 补 SUSFS_LOGI_RL"
           else
-            echo "susfs.h 已有该宏或文件不存在，跳过"
+            echo "缺少 include/linux/susfs.h，无法补日志宏"
           fi
           grep -q 'CFLAGS_susfs.o' fs/Makefile || { echo "::error::没写进 fs/Makefile"; exit 1; }
           echo "--- fs/Makefile 末尾 ---"

@@ -946,6 +946,65 @@ static struct kprobe kp_setmode = {
 	.pre_handler = watch_setmode,
 };
 
+/* 只读取证：mode 里每个内核指针，顺着它扫前 8KB，找 120 档的时钟指纹。
+ * 上一轮挂机的怀疑点就是这些私有对象（priv_info）里还留着 120 的时序。 */
+static u32 priv_hits;
+
+static void priv_scan(void)
+{
+	u32 i, off, j;
+
+	if (!layout_ok) {
+		say("privscan：还没有布局，先息屏亮屏一次");
+		return;
+	}
+	priv_hits = 0;
+	say("privscan：count=%u stride=0x%x，指纹 clk=%u pclk=852681600 transfer=%u",
+	    L.count, L.stride, src_clk, src_transfer);
+	for (i = 0; i < L.count; i++) {
+		unsigned long m = mode_at(i);
+		u16 f = 0;
+
+		if (!kern(m))
+			continue;
+		rd(m + L.fps_off, &f, sizeof(f));
+		say("mode[%u] @0x%lx fps=%u", i, m, f);
+		for (off = 0; off + 8 <= L.stride && priv_hits < 48; off += 8) {
+			u64 v = 0;
+			unsigned long p;
+
+			if (rd(m + off, &v, sizeof(v)))
+				continue;
+			p = (unsigned long)v;
+			if (!kern(p))
+				continue;
+			for (j = 0; j + 4 <= 0x2000 && priv_hits < 48; j += 4) {
+				u32 x = r32(p + j, NULL);
+
+				if (x == src_clk) {
+					say("  mode[%u]+0x%x -> 0x%lx+0x%x = clk", i, off, p, j);
+					priv_hits++;
+				} else if (x == 852681600) {
+					say("  mode[%u]+0x%x -> 0x%lx+0x%x = pclk", i, off, p, j);
+					priv_hits++;
+				} else if (x == src_transfer) {
+					say("  mode[%u]+0x%x -> 0x%lx+0x%x = transfer", i, off, p, j);
+					priv_hits++;
+				}
+			}
+		}
+	}
+	say("privscan 结束，命中 %u 条", priv_hits);
+}
+
+static int privscan_set(const char *val, const struct kernel_param *kp)
+{
+	priv_scan();
+	return 0;
+}
+
+static const struct kernel_param_ops privscan_ops = { .set = privscan_set };
+
 static int save_one(u32 lay, u32 slot, struct save_rec *sv)
 {
 	unsigned long m = lay_mode(lay, slot);
@@ -1145,10 +1204,12 @@ module_param_cb(report, &report_ops, NULL, 0444);
 module_param_cb(state, &state_ops, NULL, 0644);
 module_param_cb(apply, &apply_ops, NULL, 0644);
 module_param_cb(rescan, &rescan_ops, NULL, 0200);
+module_param_cb(privscan, &privscan_ops, NULL, 0200);
 MODULE_PARM_DESC(report, "发现与改写过程（读这个，别只靠 dmesg）");
 MODULE_PARM_DESC(state, "当前布局与状态；写任意值清空 report");
 MODULE_PARM_DESC(apply, "1=把选中的 120 档改写成 144；0=还原");
 MODULE_PARM_DESC(rescan, "写任意值重新发现布局");
+MODULE_PARM_DESC(privscan, "写任意值扫描每条 mode 的私有对象里的 120 指纹（只读）");
 
 module_param(probe_only, bool, 0644);
 module_param(want_clk, uint, 0644);

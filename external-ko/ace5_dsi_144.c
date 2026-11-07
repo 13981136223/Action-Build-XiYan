@@ -32,6 +32,7 @@
 #include <linux/err.h>
 #include <linux/spinlock.h>
 #include <linux/of.h>
+#include <linux/slab.h>
 
 #define TAG "ace5_144"
 #define OBJ_WIN 2048			/* dsi_display 对象扫描窗口 */
@@ -154,6 +155,12 @@ static void w32(unsigned long a, u32 v)
 }
 
 static void w16(unsigned long a, u16 v)
+{
+	if (kern(a))
+		memcpy((void *)a, &v, sizeof(v));
+}
+
+static void w64(unsigned long a, u64 v)
 {
 	if (kern(a))
 		memcpy((void *)a, &v, sizeof(v));
@@ -1050,6 +1057,23 @@ static int peek_set(const char *val, const struct kernel_param *kp)
 static const struct kernel_param_ops privscan_ops = { .set = privscan_set };
 static const struct kernel_param_ops peek_ops = { .set = peek_set };
 
+static int do_append(void);
+static void undo_append(void);
+
+static int doappend_set(const char *val, const struct kernel_param *kp)
+{
+	return do_append();
+}
+
+static int undoappend_set(const char *val, const struct kernel_param *kp)
+{
+	undo_append();
+	return 0;
+}
+
+static const struct kernel_param_ops doappend_ops = { .set = doappend_set };
+static const struct kernel_param_ops undoappend_ops = { .set = undoappend_set };
+
 static int save_one(u32 lay, u32 slot, struct save_rec *sv)
 {
 	unsigned long m = lay_mode(lay, slot);
@@ -1181,6 +1205,178 @@ static int do_restore(void)
 	return 0;
 }
 
+/* ---------- 追加第 5 条 144 模式（默认关闭，需要 count_off） ----------
+ * 学一加15 参照实现：复制 mode、复制私有对象、换数组指针、改计数。
+ * 旧数组不释放（驱动可能还持有它的指针，释放会 UAF）。
+ */
+static u32 count_off = U32_MAX;		/* dsi_display 里模式计数的偏移 */
+static u32 count_off2 = U32_MAX;	/* 第二处计数（如有） */
+static u32 priv_size;			/* 0 = 现场 ksize() */
+static unsigned long APP_ARR;
+static unsigned long APP_PRIV;
+static bool appended;
+
+static bool find_priv(unsigned long mode, u32 *poff, u32 *pclk_off,
+		      u32 *ppix_off, unsigned long *ppriv)
+{
+	u32 off, j;
+
+	for (off = 0; off + 8 <= L.stride; off += 8) {
+		u64 v = 0;
+		unsigned long p;
+
+		if (rd(mode + off, &v, sizeof(v)))
+			continue;
+		p = (unsigned long)v;
+		if (!kern(p))
+			continue;
+		for (j = 0; j + 4 <= 0x1000; j += 4) {
+			if (r32(p + j, NULL) == src_clk) {
+				u32 k;
+
+				*poff = off;
+				*pclk_off = j;
+				*ppix_off = U32_MAX;
+				for (k = 0; k + 4 <= 0x1000; k += 4) {
+					if (r32(p + k, NULL) == 852681600) {
+						*ppix_off = k;
+						break;
+					}
+				}
+				*ppriv = p;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static void find_index_fields(u32 *offs, u32 *n)
+{
+	u32 off, i;
+
+	*n = 0;
+	for (off = 0; off + 4 <= L.stride && *n < 4; off += 4) {
+		bool good = true;
+
+		for (i = 0; i < L.count; i++) {
+			if (r32(mode_at(i) + off, NULL) != i) {
+				good = false;
+				break;
+			}
+		}
+		if (good && L.count > 1)
+			offs[(*n)++] = off;
+	}
+}
+
+static void undo_append(void)
+{
+	if (!appended)
+		return;
+	w64(L.display + L.modes_off, L.modes_arr);
+	w32(L.display + count_off, L.count);
+	if (count_off2 != U32_MAX)
+		w32(L.display + count_off2, L.count);
+	appended = false;
+	say("append 已撤销：数组指针与计数还原（新数组保留不释放）");
+}
+
+static int do_append(void)
+{
+	u32 i, ncount, idx_offs[4], idx_n = 0;
+	unsigned long src, dst, newm, sp = 0, np;
+	size_t psize;
+	u32 poff = 0, pclk_off = U32_MAX, ppix_off = U32_MAX;
+
+	if (probe_only) {
+		failure_code = 2;
+		say("probe_only=1，拒绝 append");
+		return -EPERM;
+	}
+	if (!layout_ok || L.slot < 0) {
+		failure_code = 3;
+		return -ENOENT;
+	}
+	if (count_off == U32_MAX) {
+		failure_code = 12;
+		say("append：还没有 count_off（先用 peek 找 display 里的计数偏移）");
+		return -EINVAL;
+	}
+	if (!fps_sequence_ok()) {
+		failure_code = 7;
+		return -EINVAL;
+	}
+	src = mode_at(L.slot);
+	if (!find_priv(src, &poff, &pclk_off, &ppix_off, &sp)) {
+		failure_code = 13;
+		say("append：mode 的私有对象里没找到时钟指纹");
+		return -ENOENT;
+	}
+	say("append：源 mode=0x%lx priv=0x%lx priv_off=+0x%x clk@+0x%x pix@0x%x",
+	    src, sp, poff, pclk_off, ppix_off);
+
+	ncount = L.count + 1;
+	dst = (unsigned long)kzalloc((size_t)ncount * L.stride, GFP_KERNEL);
+	if (!dst) {
+		failure_code = 14;
+		return -ENOMEM;
+	}
+	for (i = 0; i < L.count; i++) {
+		if (rd(mode_at(i), (void *)(dst + (unsigned long)i * L.stride), L.stride))
+			goto bad;
+	}
+	newm = dst + (unsigned long)L.count * L.stride;
+	if (rd(src, (void *)newm, L.stride))
+		goto bad;
+
+	find_index_fields(idx_offs, &idx_n);
+	say("append：index 字段 %u 个（+0x%x +0x%x）", idx_n,
+	    idx_n > 0 ? idx_offs[0] : 0, idx_n > 1 ? idx_offs[1] : 0);
+	for (i = 0; i < idx_n; i++)
+		w32(newm + idx_offs[i], L.count);
+	if (!keep_fps)
+		w16(newm + L.fps_off, (u16)want_fps);
+	w32(newm + L.clk_off, want_clk);
+	for (i = 0; i < LAY[0].derived_n && i < 4; i++) {
+		bool ok;
+		u32 ov = r32(newm + LAY[0].derived[i], &ok);
+
+		if (ok && ov)
+			w32(newm + LAY[0].derived[i], (u32)((u64)ov * want_fps / 120));
+	}
+	if (LAY[0].transfer_off != U32_MAX &&
+	    r32(newm + LAY[0].transfer_off, NULL) == src_transfer)
+		w32(newm + LAY[0].transfer_off, want_transfer);
+
+	psize = priv_size ? priv_size : ksize((void *)sp);
+	np = (unsigned long)kmemdup((void *)sp, psize, GFP_KERNEL);
+	if (!np)
+		goto bad;
+	w32(np + pclk_off, want_clk);
+	if (ppix_off != U32_MAX)
+		w32(np + ppix_off, (u32)(852681600ULL * want_fps / 120));
+	w64(newm + poff, np);
+
+	w64(L.display + L.modes_off, dst);
+	w32(L.display + count_off, ncount);
+	if (count_off2 != U32_MAX)
+		w32(L.display + count_off2, ncount);
+
+	APP_ARR = dst;
+	APP_PRIV = np;
+	appended = true;
+	say("append 完成：count %u->%u，数组 0x%lx，私有对象 0x%lx（%zu 字节）",
+	    L.count, ncount, dst, np, psize);
+	say("验收：cat /sys/class/drm/card0-DSI-1/modes 应有第 5 条 144");
+	return 0;
+bad:
+	kfree((void *)dst);
+	failure_code = 14;
+	say("append：复制/分配失败");
+	return -ENOMEM;
+}
+
 static int report_get(char *buf, const struct kernel_param *kp)
 {
 	size_t n = READ_ONCE(report_len);
@@ -1196,10 +1392,11 @@ static int state_get(char *buf, const struct kernel_param *kp)
 	return scnprintf(buf, 4000,
 		"display=0x%lx layout=%d applied=%d probe_only=%d fail=%u slot=%d count=%u "
 		"modes_off=0x%x arr=0x%lx clk_off=0x%x fps_off=0x%x(%s) transfer_off=0x%x "
-		"khz_off=0x%x panel_off=0x%x adfr_off=0x%x clk_n=%u priv_off=0x%x priv_clk_off=0x%x contig=%u stride=0x%x adfr_calls=%d\n",
+		"khz_off=0x%x panel_off=0x%x adfr_off=0x%x clk_n=%u priv_off=0x%x priv_clk_off=0x%x contig=%u stride=0x%x adfr_calls=%d appended=%d app_arr=0x%lx app_priv=0x%lx\n",
 		L.display, layout_ok, applied, probe_only, failure_code, L.slot, L.count,
 		L.modes_off, L.modes_arr, L.clk_off, L.fps_off, L.fps_u16 ? "u16" : "u32",
-		L.transfer_off, L.khz_off, L.panel_off, L.adfr_off, L.clk_n, L.priv_off, L.priv_clk_off, L.contig, L.stride, adfr_calls);
+		L.transfer_off, L.khz_off, L.panel_off, L.adfr_off, L.clk_n, L.priv_off, L.priv_clk_off, L.contig, L.stride, adfr_calls,
+		appended, APP_ARR, APP_PRIV);
 }
 
 static int state_set(const char *val, const struct kernel_param *kp)
@@ -1251,6 +1448,8 @@ module_param_cb(apply, &apply_ops, NULL, 0644);
 module_param_cb(rescan, &rescan_ops, NULL, 0200);
 module_param_cb(privscan, &privscan_ops, NULL, 0200);
 module_param_cb(peek, &peek_ops, NULL, 0200);
+module_param_cb(doappend, &doappend_ops, NULL, 0200);
+module_param_cb(undoappend, &undoappend_ops, NULL, 0200);
 MODULE_PARM_DESC(report, "发现与改写过程（读这个，别只靠 dmesg）");
 MODULE_PARM_DESC(state, "当前布局与状态；写任意值清空 report");
 MODULE_PARM_DESC(apply, "1=把选中的 120 档改写成 144；0=还原");
@@ -1264,6 +1463,12 @@ module_param(want_fps, uint, 0644);
 module_param(want_transfer, uint, 0644);
 module_param(keep_fps, bool, 0644);
 MODULE_PARM_DESC(keep_fps, "1=不改帧率标签（保持 120，系统仍能匹配；实际时钟按 144 下发）");
+module_param(count_off, uint, 0644);
+MODULE_PARM_DESC(count_off, "append 用：dsi_display 里模式计数字段的偏移（0xffffffff=未设置）");
+module_param(count_off2, uint, 0644);
+MODULE_PARM_DESC(count_off2, "append 用：第二处计数字段的偏移（没有就保持默认）");
+module_param(priv_size, uint, 0644);
+MODULE_PARM_DESC(priv_size, "append 用：私有对象大小，0=现场 ksize()");
 module_param(apply_step, uint, 0644);
 MODULE_PARM_DESC(apply_step, "分步写入 0=只校验 1=transfer 2=+fps 3=+DSI时钟 4=+drm kHz 5=+adfr/DT");
 module_param(want_slot, int, 0644);
@@ -1303,6 +1508,8 @@ static void __exit ace5_144_exit(void)
 {
 	if (applied)
 		do_restore();
+	if (appended)
+		undo_append();
 	unregister_kprobe(&kp_disp);
 	if (kp_val.addr)
 		unregister_kprobe(&kp_val);

@@ -1003,7 +1003,52 @@ static int privscan_set(const char *val, const struct kernel_param *kp)
 	return 0;
 }
 
+/* 通用只读取证：写 "0x地址[:长度]" 到 peek，把原始字节打进 report。
+ * 长度上限 256，避免把 report 撑爆。 */
+static int peek_set(const char *val, const struct kernel_param *kp)
+{
+	char *end;
+	unsigned long addr;
+	unsigned int len = 64, i, j;
+
+	addr = simple_strtoull(val, &end, 16);
+	if (end && *end == ':')
+		len = (unsigned int)simple_strtoul(end + 1, NULL, 10);
+	if (!len || len > 256)
+		len = 256;
+	if (!kern(addr) || (addr & 7)) {
+		say("peek：地址不合法 0x%lx", addr);
+		return -EINVAL;
+	}
+	say("peek 0x%lx len=%u", addr, len);
+	for (i = 0; i < len; i += 16) {
+		u8 buf[16];
+		char line[160];
+		unsigned int n = (len - i) > 16 ? 16 : (len - i);
+		int p = 0;
+
+		memset(buf, 0, sizeof(buf));
+		if (rd(addr + i, buf, n)) {
+			say("  +0x%03x <读失败>", i);
+			continue;
+		}
+		p += scnprintf(line + p, sizeof(line) - p, "  +0x%03x:", i);
+		for (j = 0; j < n; j++)
+			p += scnprintf(line + p, sizeof(line) - p, " %02x", buf[j]);
+		for (; j < 16; j++)
+			p += scnprintf(line + p, sizeof(line) - p, "   ");
+		p += scnprintf(line + p, sizeof(line) - p, "  |");
+		for (j = 0; j < n; j++)
+			p += scnprintf(line + p, sizeof(line) - p, "%c",
+				       (buf[j] >= 0x20 && buf[j] < 0x7f) ? buf[j] : '.');
+		scnprintf(line + p, sizeof(line) - p, "|");
+		say("%s", line);
+	}
+	return 0;
+}
+
 static const struct kernel_param_ops privscan_ops = { .set = privscan_set };
+static const struct kernel_param_ops peek_ops = { .set = peek_set };
 
 static int save_one(u32 lay, u32 slot, struct save_rec *sv)
 {
@@ -1205,11 +1250,13 @@ module_param_cb(state, &state_ops, NULL, 0644);
 module_param_cb(apply, &apply_ops, NULL, 0644);
 module_param_cb(rescan, &rescan_ops, NULL, 0200);
 module_param_cb(privscan, &privscan_ops, NULL, 0200);
+module_param_cb(peek, &peek_ops, NULL, 0200);
 MODULE_PARM_DESC(report, "发现与改写过程（读这个，别只靠 dmesg）");
 MODULE_PARM_DESC(state, "当前布局与状态；写任意值清空 report");
 MODULE_PARM_DESC(apply, "1=把选中的 120 档改写成 144；0=还原");
 MODULE_PARM_DESC(rescan, "写任意值重新发现布局");
 MODULE_PARM_DESC(privscan, "写任意值扫描每条 mode 的私有对象里的 120 指纹（只读）");
+MODULE_PARM_DESC(peek, "只读：写 0x地址[:长度] dump 原始字节（长度<=256）");
 
 module_param(probe_only, bool, 0644);
 module_param(want_clk, uint, 0644);

@@ -56,7 +56,8 @@ static bool applied;
 static bool layout_ok;
 static u32 failure_code;
 static int want_slot = -1;
-static u32 apply_step;		/* 0=只校验 1=transfer 2=+fps 3=+DSI时钟 4=+kHz 5=+adfr/DT */		/* -1 = 自动选最后一条 120 */
+static u32 apply_step;
+static bool keep_fps;		/* 0=只校验 1=transfer 2=+fps 3=+DSI时钟 4=+kHz 5=+adfr/DT */		/* -1 = 自动选最后一条 120 */
 static char panel_node[64] = "qcom,mdss_dsi_panel_AA577_P_3_A0020_dsc_cmd";
 
 static struct {
@@ -933,7 +934,7 @@ static void patch_saved(struct save_rec *sv)
 	    sv->lay, sv->slot, m, apply_step, sv->clk, want_clk, sv->fps16, want_fps);
 	if (apply_step >= 3)
 		w32(m + ly->clk_off, want_clk);
-	if (apply_step >= 2)
+	if (apply_step >= 2 && !keep_fps)
 		w16(m + ly->fps_off, (u16)want_fps);
 	if (apply_step >= 3) {
 		for (i = 0; i < (int)ly->derived_n && i < 4; i++) {
@@ -1108,6 +1109,8 @@ module_param(probe_only, bool, 0644);
 module_param(want_clk, uint, 0644);
 module_param(want_fps, uint, 0644);
 module_param(want_transfer, uint, 0644);
+module_param(keep_fps, bool, 0644);
+MODULE_PARM_DESC(keep_fps, "1=不改帧率标签（保持 120，系统仍能匹配；实际时钟按 144 下发）");
 module_param(apply_step, uint, 0644);
 MODULE_PARM_DESC(apply_step, "分步写入 0=只校验 1=transfer 2=+fps 3=+DSI时钟 4=+drm kHz 5=+adfr/DT");
 module_param(want_slot, int, 0644);

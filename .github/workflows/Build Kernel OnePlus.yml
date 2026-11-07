@@ -1653,6 +1653,7 @@ jobs:
           diff -u "$SRC.orig" "$SRC" | head -40
 
       - name: Let unused SUSFS helpers compile
+        if: ${{ github.event.inputs.SUSFS_META != '-1' }}
         run: |
           # 全量档（非 FAST）实测倒在 fs/susfs.o：
           #   error: unused function 'susfs_switch_to_ksu_domain' [-Werror,-Wunused-function]
